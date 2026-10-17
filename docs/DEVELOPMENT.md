@@ -77,6 +77,29 @@ Owner 已要求直接提交推送主干、不另建分支；正常文档初始�
 
 本轮验收采用全文件复读、仓内链接及固定引用核对、Markdown 结构与空白检查，并将正常、失败、丢响应、重复、取消竞争、错误版本、验证污染及未配置知识等边界逐项映射到实施计划。程序编译、故障注入和安装态验证仍待实现后执行，不把矩阵里的预期结果标成实测通过。
 
+## 2026-10-18 第二轮全仓复核
+
+复核起点为 `4632865e466bc68ee198f7c88a1303ebd0a165e2`，全部七个文件重新检查。本轮修正三组会影响实现的接续问题，没有新增产品模块：
+
+- **取消可达性和在途提交**：区分执行者占用与短时状态锁，不在写事务中等待远端响应；取消先于接纳返回 `NOT_FOUND` 时保留意图，原任务出现后继续取消。旧调用退出/EOF 不明不阻断原任务的有界只读查询。
+- **读回的本地副作用**：`read_version` 先发布新目录再返回结果，发布后丢回执时同路径重试会冲突。方案改为保留原输出，在预算内用新目录读回同一版本并重新核对，不仅凭目录存在认定成功。
+- **准备修订与不可变历史**：明确接纳前失败或过期请求经原服务允许后可沿同一 UUID 重新准备，新 READY 请求另存修订；原已发送请求保持历史，不把保留历史误解成禁止合法接续。
+
+依据仍是固定 Local Hand `f208f0fc174164f1b866499916759aad1aa22f84`：`ResidentBroker.call` 在 IDLE 取消时返回未找到，`Broker.cancel` 只操作已经存在的原任务，`artifact_archive.read_version/_publish_files` 先发布目录后返回。没有更改 Local Hand 源码或调用线上任务。
+
+针对新疑问，运行了该依赖既有 `tests/test_local_hand_resident.py` 中的六项单元测试，全部通过、无跳过：
+
+| 测试类 | 方法 |
+| --- | --- |
+| `ResidentTests` | `test_cancel_before_submission_or_during_preparation_does_not_launch` |
+| `ResidentTests` | `test_cancel_response_loss_never_redelivers_or_restarts_and_status_remains_usable` |
+| `ResidentTests` | `test_one_transient_read_failure_does_not_disable_future_queries` |
+| `PreparationTests` | `test_successful_preparation_retry_polls_preserve_the_ready_request` |
+| `PreparationTests` | `test_stale_unsubmitted_request_can_still_be_prepared_for_the_same_uuid` |
+| `PreparationTests` | `test_explicit_retry_replaces_only_a_proved_uncommitted_execution_failure` |
+
+这些测试使用模拟执行端和临时记录，仅核实所依赖的分支语义，不是本控制组件已实现或现场通过的证据。读回发布边界采用源码及既有测试用例核对，未重新运行归档集成测试。仓内链接、固定引用、Markdown 结构与提交差异检查通过；本仓仍无编译目标，新增取消竞态、锁行为和读回故障用例列入实施计划，尚未作新组件实测。
+
 ## 下一步
 
 按[实施计划](IMPLEMENTATION_PLAN.md)从最小运行记录和公共入口开始。首次实际任务前核对现有部署、选择已登记的真实目标和具体预算；未知部署细节先查现有配置和记录，不要求 Owner 重找已有机器、共享和凭据。
