@@ -1,0 +1,37 @@
+# 维护与接续
+
+先读 [README](README.md)、[需求](docs/REQUIREMENTS.md)、[架构](docs/ARCHITECTURE.md)和[实施计划](docs/IMPLEMENTATION_PLAN.md)。当前为文档初始化阶段，产品代码与实际执行尚未开始。当前决定、来源基线和待办见[开发与接续记录](docs/DEVELOPMENT.md)。
+
+## 当前方向
+
+本仓是生产方向的控制组件，名字保留 `control-production-plane`。先完成窄范围软件任务的执行、验证、修复、恢复与验收协调，复用 Local Hand 和 Ledger；知识方向留出接入边界。不能把已有基础组件的成功宣称成本仓已实现或完整系统已验收。
+
+README 面向使用者，解释用途、关系、能力和入口；开发历史、阶段过程、接续点放在开发记录。图示应让读者第一眼看出主线与最终用途，辅助存储放在旁侧；修改图时核对实际渲染、文字与有向连线，不为好看改变真实语义。
+
+沿用 Owner 已明确的直接提交、推送主干偏好，不自行开分支或 PR。保持每次变更可审阅、可验证；该偏好不等于获准部署、改动无关仓库或覆盖用户数据。
+
+## 工程规则来源与采用范围
+
+- 来源：`kongbu0621/engineering-sop`。
+- 固定基线：`9372247bdfa24f46694bf2435ef9917e155e166c`，不自动跟随上游 main。
+- 本轮适用范围：`docs/principles/reusable-module-repository-boundaries.md` 的仓库边界、`docs/workflow/verification-evidence-gate.md` 的风险相称验证，以及下述 Owner-mandated 文档和建仓规则；不声明整体采用全部 Established 或 Experimental 规则。
+- Owner-mandated 规则来源：固定 SOP 的 `AGENTS.md` 及 `docs/workflow/program-repository-documentation-gate.md`、`docs/principles/repository-formation-standard-v1.0.md`。两项仍为 Provisional，适用的三层设计、建仓和真实授权边界保留；仓库已创建不证明 Git Authority Admission 已完成。
+- 图示维护参考：同基线 `docs/principles/diagram-reading-order.md`，保留其 Provisional 状态。
+- 采用与优先级依据：同基线 `docs/workflow/project-adoption-and-precedence.md`。Owner 的具体指令按真实范围落实，不以旧文档形式要求重复批准或重做已完成任务。
+- 可读取来源：有权限的维护环境中的同级 `engineering-sop` checkout，或该仓固定提交。核对完整 SHA 后读取相应正文；本文件是采用索引，不代替上游正文。
+- 公开边界：不将私有规则正文、聊天或部署资料复制入本仓。公开使用者理解和使用产品不依赖这些维护资料；来源不可读时仅暂停依赖该不明规则的决定，不假设新增权限。
+- 决定权：Owner。规则采用、升级、例外和权限变化依据真实决定记录，不由助手自授；本次没有新增例外。
+- 项目事实及具体契约：以本仓三份设计、后续公共接口文档和实际验证记录为准，不把路线图候选当作已实现合同。
+
+## 实施边界
+
+- 保留目标、输入、原请求、任务身份、失败和未知结果。可能有写入但结果未知时先查询原任务，不更换 ID 盲目重放。
+- 普通本地失败修正后继续；只读调用允许有界重试。已完成动作复用真实结果，不因旧失败永久禁止恢复。
+- 使用依赖的公共接口，不直接操作 Local Hand 或 Ledger 私有数据库，不将控制逻辑塞入基础组件。
+- 不把收到取消回执当作退出证明，不把任务副本修改当作目标工作区应用，不把测试通过当作验收决定。
+- 不把恢复、归档或换会话解释为重跑历史业务。Ledger A2 既有记录配置内的完成事实继续保留；本仓闭环只贡献 A3 的一个消费侧。
+- 原整体原型仅作历史参考，不将旧 `local_ai_agent` 或旧 `local-ai-growth` 引入本仓作为新实现宿主，不新增计划外仓库。
+- 软件实现使用独立项目环境；运行数据、凭据、原始日志、机器地址与实际个人内容保持私有。公开样例须合成，证据结论不得伪造。
+- 验证针对改动风险；文档做链接和语义核对，事务、恢复、身份和安装行为使用对应真实路径验证。未运行、未知和通过分开报告。
+
+当前设计中的新方案应明确标识为提案。已有授权内的实现细节和普通修复直接推进；目标、权限或重要约束真的缺失时，先完成可独立推进的核查和具体方案，只就依赖该缺口的动作澄清。
