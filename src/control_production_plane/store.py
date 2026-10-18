@@ -355,7 +355,9 @@ class ControlStore:
             pending = self._pending(db, run_id)
             queued = [r[0] for r in db.execute("SELECT action_id FROM actions WHERE run_id=? AND json_extract(document,'$.state')='QUEUED'", (run_id,))]
             attempt = state["attempt"]
-            if attempt["observation"] and attempt["observation"]["exited"]:
+            if attempt.get("maintenance_stop"):
+                next_step = "REVIEW_STOPPED_RESULT_GAPS"
+            elif attempt["observation"] and attempt["observation"]["exited"]:
                 next_step = "REVIEW_OBSERVED_RESULT"
             elif attempt["submission_recorded"]:
                 next_step = "QUERY_ORIGINAL_TASK"
@@ -384,7 +386,8 @@ class ControlStore:
                     "close_call": self._close_call, "observe": self._observe, "abandon": self._abandon,
                     "learning_candidate": self._learning, "preflight_failure": self._preflight_failure,
                     "not_started": self._not_started, "candidate": self._candidate,
-                    "decide": self._decide, "confirm_not_accepted": self._confirm_not_accepted}
+                    "decide": self._decide, "confirm_not_accepted": self._confirm_not_accepted,
+                    "confirm_stopped": self._confirm_stopped}
         m.require(type(operation) is str and operation in handlers, "Unknown operation")
         fingerprint = m.digest(request)
         committing = False
@@ -516,7 +519,8 @@ class ControlStore:
             for other_id, document in db.execute("SELECT run_id,document FROM runs WHERE run_id!=?", (state["run_id"],)):
                 other = json.loads(document)
                 observed = other["attempt"]["observation"]
-                m.require(not other["attempt"]["submission_recorded"] or (observed and observed["exited"]),
+                m.require(not other["attempt"]["submission_recorded"] or (observed and observed["exited"])
+                          or self._stopped_binding(other),
                           "Another run has an unresolved execution", "PENDING")
                 m.require(not [a for a in self._pending(db, other_id) if a["kind"] != "query"],
                           "Another run has an unresolved call", "PENDING")
@@ -660,6 +664,46 @@ class ControlStore:
         self._save_action(db, action)
         self._save(db, state)
         return dict(run_id=state['run_id'], action_id=body['action_id'], non_acceptance_recorded=True)
+
+    @staticmethod
+    def _stopped_binding(state):
+        proof = state['attempt'].get('maintenance_stop')
+        if proof is None:
+            return False
+        attempt = state['attempt']
+        m.require(proof['run_id'] == state['run_id'] and proof['attempt_id'] == attempt['attempt_id']
+                  and proof['operation_id'] == attempt['operation_id']
+                  and proof['request_digest'] == attempt['prepared_request']['request_digest']
+                  and proof['binding_digest'] == m.digest(state['binding'])
+                  and proof['effect_scope'] == 'TASK_OWNED_COPY'
+                  and all(proof[k] is True for k in ('future_start_blocked', 'tree_exited', 'writers_stopped')),
+                  'Maintenance stop proof binding differs', 'STORE_INVALID')
+        return True
+
+    def _confirm_stopped(self, db, body, lease):
+        """Retain a trusted maintenance proof without rewriting remote status."""
+        m.fields(body, 'run_id attempt_id operation_id request_digest binding_digest evidence_ref '
+                      'future_start_blocked tree_exited writers_stopped effect_scope')
+        state = self._load(db, body['run_id']); attempt = state['attempt']
+        m.identity(body['evidence_ref']); m.sha(body['request_digest']); m.sha(body['binding_digest'])
+        m.require(attempt['submission_recorded'] and attempt['prepared_request'] is not None,
+                  'No original submission to close', 'NOT_READY')
+        m.require(body['attempt_id'] == attempt['attempt_id'] and body['operation_id'] == attempt['operation_id']
+                  and body['request_digest'] == attempt['prepared_request']['request_digest']
+                  and body['binding_digest'] == m.digest(state['binding']),
+                  'Maintenance proof identity differs', 'IDENTITY_CONFLICT')
+        m.require(attempt['prepared_request']['kind'] == 'workspace.edit'
+                  and body['effect_scope'] == 'TASK_OWNED_COPY'
+                  and all(body[k] is True for k in ('future_start_blocked', 'tree_exited', 'writers_stopped')),
+                  'Complete stop proof for task-owned workspace required', 'NOT_READY')
+        old = attempt.get('maintenance_stop')
+        if old is not None:
+            m.require(old == body, 'Original stop proof differs', 'CONFLICT')
+            return dict(run_id=state['run_id'], attempt_id=attempt['attempt_id'], stop_proof_recorded=True)
+        m.require(not self._pending(db, state['run_id']), 'Original calls remain unclosed', 'PENDING')
+        attempt['maintenance_stop'] = body
+        self._save(db, state)
+        return dict(run_id=state['run_id'], attempt_id=attempt['attempt_id'], stop_proof_recorded=True)
 
     def _not_started(self, db, body, lease):
         m.fields(body, "action_id evidence_ref")
