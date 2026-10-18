@@ -326,6 +326,72 @@ class CoreTests(unittest.TestCase):
                            lambda p: {"response": {"accepted": True}, "call_closed": True})
         self.assertEqual(self.store.get_run("example")["counters"]["attempts"], 1)
 
+    def test_incomplete_preparation_history_cannot_restore_old_ready(self):
+        for fault in ("missing", "wrong_run", "wrong_action", "wrong_attempt", "wrong_kind",
+                      "invalid_response", "invalid_json", "invalid_kind", "missing_queue"):
+            with self.subTest(fault=fault):
+                path = self.root / fault
+                self.store = initialize(path)
+                self.store.execute(command("create", self.spec))
+                self.store.execute(command("create", sample("other")))
+                first = self.prepare()
+                failed = self.queue("prepare")
+                self.store.perform(failed, self.spec["binding"],
+                                   lambda p: {"response": {"state": "FAILED"}, "call_closed": True})
+                broken = self.store.get_action(failed)
+                retry = self.queue("prepare")
+                with self.store.executor() as lease:
+                    self.store.execute(command("dispatch", {"action_id": retry, "observed_binding": self.spec["binding"]}), lease=lease)
+                # Inject damaged history while retaining its dispatch event.
+                # quick_check cannot detect these broken logical links.
+                with sqlite3.connect(path / "runs.sqlite") as db:
+                    if fault == "missing":
+                        db.execute("DELETE FROM actions WHERE action_id=?", (failed,))
+                    elif fault == "wrong_run":
+                        db.execute("UPDATE actions SET run_id='other' WHERE action_id=?", (failed,))
+                    elif fault == "missing_queue":
+                        db.execute("DELETE FROM events WHERE operation='queue' AND json_extract(body,'$.action_id')=?", (failed,))
+                    else:
+                        if fault == "wrong_action":
+                            broken["action_id"] = str(uuid.uuid4())
+                        elif fault == "wrong_attempt":
+                            broken["attempt_id"] = str(uuid.uuid4())
+                        elif fault == "wrong_kind":
+                            broken["kind"] = "query"
+                        elif fault == "invalid_response":
+                            broken["response"] = None
+                        elif fault == "invalid_kind":
+                            broken["kind"] = []
+                        document = "[" if fault == "invalid_json" else canonical(broken).decode()
+                        db.execute("UPDATE actions SET document=? WHERE action_id=?", (document, failed))
+                    self.assertEqual(db.execute("PRAGMA quick_check").fetchone()[0], "ok")
+                self.store = open_store(path)
+                before = (path / "runs.sqlite").read_bytes()
+                proof = command("not_started", {"action_id": retry, "evidence_ref": "demo:local-start-rejected"})
+                self.error("STORE_INVALID", self.store.execute, proof)
+                self.assertEqual((path / "runs.sqlite").read_bytes(), before)
+                self.assertIsNone(self.store.get_run("example")["attempt"]["prepared_request"])
+                self.assertEqual(self.store.get_action(retry)["state"], "MAY_HAVE_RUN")
+                self.assertEqual(self.store.get_action(first)["response"]["state"], "READY")
+                self.error("NOT_READY", self.queue, "submit")
+
+    def test_missing_ready_history_blocks_queue_and_dispatch_without_effect(self):
+        first = self.prepare()
+        # Losing the newest READY cannot silently fall back to an older one.
+        newer = self.prepare()
+        queued = self.queue("submit")
+        with sqlite3.connect(self.path / "runs.sqlite") as db:
+            db.execute("DELETE FROM actions WHERE action_id=?", (newer,))
+        before = (self.path / "runs.sqlite").read_bytes()
+        self.error("STORE_INVALID", self.queue, "submit")
+        self.assertEqual((self.path / "runs.sqlite").read_bytes(), before)
+        # A request queued before the loss must also be checked at dispatch.
+        effects = []
+        self.error("STORE_INVALID", self.store.perform, queued, self.spec["binding"], effects.append)
+        self.assertEqual(effects, [])
+        self.assertEqual((self.path / "runs.sqlite").read_bytes(), before)
+        self.assertEqual(self.store.get_action(first)["response"]["state"], "READY")
+
     def test_no_start_proof_cannot_restore_ready_from_prior_attempt(self):
         first = self.prepare()
         old_attempt = self.store.get_run("example")["attempt"]
@@ -443,6 +509,141 @@ s.perform(sys.argv[2],s.get_run('example')['binding'],lambda payload:os._exit(72
         self.assertEqual(called, [])
         self.assertEqual(self.store.get_run("example")["counters"]["attempts"], 0)
         self.assertEqual(self.store.recover("example")["next_step"], "NO_NEW_SUBMISSION")
+
+    def test_concurrent_not_found_does_not_block_proved_nonstart_retry(self):
+        spec = sample("one-attempt")
+        spec["budget"]["max_attempts"] = 1
+        spec["budget"]["max_actions"] = 2
+        self.store.execute(command("create", spec))
+        prepare = self.queue("prepare", spec["run_id"])
+        self.store.perform(prepare, spec["binding"], ready)
+        original = self.store.get_run(spec["run_id"])["attempt"]
+        action = self.queue("submit", spec["run_id"])
+        started, release = self.root / "waiting", self.root / "release"
+        code = """
+import json, sys, time
+from pathlib import Path
+from control_production_plane import CallNotStarted, ControlError, open_store
+store = open_store(sys.argv[1])
+def invoke(payload):
+ Path(sys.argv[3]).touch()
+ deadline = time.monotonic() + 10
+ while not Path(sys.argv[4]).exists() and time.monotonic() < deadline: time.sleep(.02)
+ if not Path(sys.argv[4]).exists(): raise RuntimeError('Parent did not release callback')
+ raise CallNotStarted('demo:spawn-failed-before-transport')
+try:
+ store.perform(sys.argv[2], store.get_run('one-attempt')['binding'], invoke)
+except ControlError as exc:
+ print(json.dumps(exc.as_dict()))
+ sys.exit(0 if exc.code == 'CALL_NOT_STARTED' else 71)
+sys.exit(72)
+"""
+        child = subprocess.Popen([sys.executable, "-c", code, str(self.path), action, str(started), str(release)],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 10
+            while not started.exists() and child.poll() is None and time.monotonic() < deadline:
+                time.sleep(.02)
+            self.assertTrue(started.exists())
+            query = self.queue("query", spec["run_id"])
+            self.store.perform(query, spec["binding"],
+                               lambda p: {"response": {"state": "NOT_FOUND"}, "call_closed": True})
+            observation = {"run_id": spec["run_id"], "attempt_id": original["attempt_id"],
+                           "operation_id": original["operation_id"], "request_digest": original["prepared_request"]["request_digest"],
+                           "remote_state": "NOT_FOUND", "outcome": "UNKNOWN", "exited": False,
+                           "evidence_state": "UNKNOWN", "evidence_ref": "demo:concurrent-query"}
+            self.store.execute(command("observe", observation))
+            # NOT_FOUND alone does not refund or allow another submission.
+            self.assertEqual(self.store.get_run(spec["run_id"])["counters"]["attempts"], 1)
+            self.error("NOT_READY", self.queue, "submit", spec["run_id"])
+        finally:
+            release.touch()
+            stdout, stderr = child.communicate(timeout=15)
+        self.assertEqual(child.returncode, 0, (stdout, stderr))
+        self.assertTrue(json.loads(stdout)["dispatch_recorded"])
+        self.store = open_store(self.path)
+        state = self.store.get_run(spec["run_id"])
+        self.assertFalse(state["attempt"]["submission_recorded"])
+        self.assertEqual(state["attempt"]["observation"], observation)
+        self.assertEqual(state["attempt"]["operation_id"], original["operation_id"])
+        self.assertEqual(state["counters"], {"actions": 1, "attempts": 0, "queries": 1, "cancellations": 0})
+        effects = []
+        def submit(payload):
+            effects.append(payload)
+            return {"response": {"accepted": True}, "call_closed": True}
+        retry = self.queue("submit", spec["run_id"])
+        self.store.perform(retry, spec["binding"], submit)
+        self.assertEqual(effects, [original["prepared_request"]])
+        self.assertEqual(self.store.get_run(spec["run_id"])["counters"]["attempts"], 1)
+        replay = self.store.execute(command("not_started", {"action_id": action,
+                                  "evidence_ref": "demo:spawn-failed-before-transport"}, "not-started:" + action))
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(self.store.get_run(spec["run_id"])["counters"]["attempts"], 1)
+        self.assertTrue(self.store.get_run(spec["run_id"])["attempt"]["submission_recorded"])
+        self.error("PENDING", self.store.perform, action, spec["binding"], submit)
+        self.assertEqual(len(effects), 1)
+
+    def test_positive_observation_history_blocks_nonstart_even_after_not_found(self):
+        for remote_state, later_missing in (("RUNNING", False), ("TERMINAL", False), ("RUNNING", True), ("NOT_FOUND", True)):
+            with self.subTest(remote_state=remote_state, later_missing=later_missing):
+                path = self.root / (remote_state + str(later_missing))
+                self.store = initialize(path)
+                self.store.execute(command("create", self.spec))
+                self.prepare()
+                action = self.queue("submit")
+                with self.store.executor() as lease:
+                    self.store.execute(command("dispatch", {"action_id": action, "observed_binding": self.spec["binding"]}), lease=lease)
+                observed = self.observation("UNKNOWN", False, remote_state)
+                if remote_state == "NOT_FOUND":
+                    observed["evidence_state"] = "SEALED"
+                self.store.execute(command("observe", observed))
+                if later_missing:
+                    self.store.execute(command("observe", self.observation("UNKNOWN", False, "NOT_FOUND")))
+                before = (path / "runs.sqlite").read_bytes()
+                self.error("CONFLICT", self.store.execute,
+                           command("not_started", {"action_id": action, "evidence_ref": "demo:contradictory-proof"}))
+                self.assertEqual((path / "runs.sqlite").read_bytes(), before)
+                self.assertTrue(self.store.get_run("example")["attempt"]["submission_recorded"])
+                self.assertEqual(self.store.get_run("example")["counters"]["attempts"], 1)
+
+    def test_nonstart_refund_commit_failure_reconciles_atomically(self):
+        real_connect = sqlite3.connect
+        for committed in (False, True):
+            with self.subTest(committed=committed):
+                path = self.root / str(committed)
+                self.store = initialize(path)
+                self.store.execute(command("create", self.spec))
+                self.prepare()
+                action = self.queue("submit")
+                with self.store.executor() as lease:
+                    self.store.execute(command("dispatch", {"action_id": action, "observed_binding": self.spec["binding"]}), lease=lease)
+                self.store.execute(command("observe", self.observation("UNKNOWN", False, "NOT_FOUND")))
+                before = self.store.get_run("example")
+                proof = command("not_started", {"action_id": action, "evidence_ref": "demo:nonstart-proof"})
+                class Connection(sqlite3.Connection):
+                    def commit(self):
+                        if committed:
+                            super().commit()
+                        raise sqlite3.OperationalError("synthetic proof commit failure")
+                with patch("control_production_plane.store.sqlite3.connect",
+                           side_effect=lambda *a, **k: real_connect(*a, **k, factory=Connection)):
+                    error = self.error("STORAGE_ERROR", self.store.execute, proof)
+                self.assertEqual(error.commit_state, "unknown")
+                self.store = open_store(path)
+                state = self.store.get_run("example")
+                if committed:
+                    self.assertFalse(state["attempt"]["submission_recorded"])
+                    self.assertEqual(state["counters"]["attempts"], 0)
+                    self.assertEqual(self.store.get_action(action)["state"], "NOT_SENT")
+                else:
+                    self.assertEqual(state, before)
+                    self.assertEqual(self.store.get_action(action)["state"], "MAY_HAVE_RUN")
+                result = self.store.execute(proof)
+                self.assertEqual(result["replayed"], committed)
+                self.assertEqual(self.store.get_run("example")["counters"]["attempts"], 0)
+                self.assertEqual(self.store.get_run("example")["attempt"]["observation"], before["attempt"]["observation"])
+                self.assertTrue(self.store.execute(proof)["replayed"])
+                self.assertEqual(self.store.get_run("example")["counters"]["attempts"], 0)
 
     def test_cancel_ack_and_not_found_do_not_become_exit_proof(self):
         self.submit()

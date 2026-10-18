@@ -200,15 +200,38 @@ class ControlStore:
         Legacy stores can retain a READY cache after a later non-ready response.
         Only proved non-starts may be skipped; unknown calls remain barriers.
         """
-        rows = db.execute("""SELECT a.document FROM events e JOIN actions a
+        rows = db.execute("""SELECT json_extract(e.body,'$.action_id'), a.run_id, a.document
+            FROM events e LEFT JOIN actions a
             ON a.action_id=json_extract(e.body,'$.action_id')
-            WHERE e.run_id=? AND e.operation='dispatch' AND a.run_id=e.run_id
-            AND json_extract(a.document,'$.attempt_id')=?
-            AND json_extract(a.document,'$.kind')='prepare' ORDER BY e.seq DESC""",
-            (state["run_id"], state["attempt"]["attempt_id"]))
-        for row in rows:
-            action = m.decode(row[0].encode("ascii"))
-            response = action["response"]
+            WHERE e.run_id=? AND e.operation='dispatch' ORDER BY e.seq DESC""",
+            (state["run_id"],))
+        for action_id, run_id, document in rows:
+            # An inner join or filtering by action fields can hide a broken
+            # link and make an older READY appear current. Check before filtering.
+            m.require(document is not None and run_id == state["run_id"],
+                      "Preparation history has a missing or conflicting action", "STORE_INVALID")
+            try:
+                action = m.decode(document.encode("ascii"))
+            except (ControlError, UnicodeError, AttributeError) as exc:
+                raise ControlError("STORE_INVALID", "Preparation history action cannot be decoded") from exc
+            m.require(isinstance(action, dict) and action.get("action_id") == action_id
+                      and action.get("run_id") == run_id
+                      and isinstance(action.get("attempt_id"), str)
+                      and isinstance(action.get("kind"), str) and action["kind"] in m.KINDS,
+                      "Preparation history action identity is inconsistent", "STORE_INVALID")
+            queued = db.execute("""SELECT body FROM events WHERE run_id=? AND operation='queue'
+                AND json_extract(body,'$.action_id')=? LIMIT 2""", (run_id, action_id)).fetchall()
+            original = {key: action[key] for key in ("run_id", "attempt_id", "action_id", "kind")}
+            m.require(len(queued) == 1 and json.loads(queued[0][0]) == original,
+                      "Preparation history differs from original queued identity", "STORE_INVALID")
+            if action["attempt_id"] != state["attempt"]["attempt_id"] or action["kind"] != "prepare":
+                continue
+            response = action.get("response")
+            m.require(action.get("state") in ("MAY_HAVE_RUN", "RESPONDED", "NOT_SENT")
+                      and type(action.get("call_closed")) is bool,
+                      "Preparation history dispatch state is invalid", "STORE_INVALID")
+            m.require(action["state"] != "RESPONDED" or isinstance(response, dict),
+                      "Preparation history response is invalid", "STORE_INVALID")
             if (action["state"] == "NOT_SENT" and action["call_closed"]
                     and isinstance(response, dict) and response.get("local_failure") == "CALL_NOT_STARTED"):
                 m.identity(response.get("evidence_ref"))
@@ -569,7 +592,21 @@ class ControlStore:
         m.require(action["state"] == "MAY_HAVE_RUN", "Call already has a result", "CONFLICT")
         m.require(action["attempt_id"] == state["attempt"]["attempt_id"], "Attempt changed", "CONFLICT")
         if action["kind"] == "submit":
-            m.require(state["attempt"]["observation"] is None, "Remote observation already exists", "CONFLICT")
+            # A concurrent NOT_FOUND is not proof of execution or non-execution.
+            # Accept an independent no-start proof only if it conflicts with no
+            # observation of this attempt, including facts later hidden by NOT_FOUND.
+            positive = db.execute("""SELECT 1 FROM events WHERE run_id=? AND operation='observe'
+                AND json_extract(body,'$.attempt_id')=? AND
+                (json_extract(body,'$.remote_state')!='NOT_FOUND'
+                 OR json_extract(body,'$.outcome')!='UNKNOWN'
+                 OR json_extract(body,'$.exited')!=0
+                 OR json_extract(body,'$.evidence_state')='SEALED') LIMIT 1""",
+                (state["run_id"], action["attempt_id"])).fetchone()
+            observation = state["attempt"]["observation"]
+            compatible = observation is None or (
+                observation["remote_state"] == "NOT_FOUND" and observation["outcome"] == "UNKNOWN"
+                and observation["exited"] is False and observation["evidence_state"] != "SEALED")
+            m.require(compatible and positive is None, "Remote observation conflicts with non-start proof", "CONFLICT")
             state["attempt"]["submission_recorded"] = False
             state["counters"]["attempts"] -= 1
         counter = {"query": "queries", "cancel": "cancellations"}.get(action["kind"], "actions")
