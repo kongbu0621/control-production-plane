@@ -703,6 +703,178 @@ sys.exit(72)
         self.store.execute(command("close_call", {"action_id": action, "evidence_ref": "demo:verified-exit-and-eof"}))
         self.store.execute(command("revise", {"run_id": "example", "expected_revision": 1, "plan": self.spec["plan"]}))
 
+    def test_transport_failure_can_receive_verified_ready_without_reinvoking(self):
+        action = self.queue("prepare")
+        calls = []
+        def lost(payload):
+            calls.append(payload)
+            raise TimeoutError()
+        self.error("CALL_UNKNOWN", self.store.perform, action, self.spec["binding"], lost)
+        original = self.store.get_action(action)
+        reply = ready(original["payload"])
+        reply["call_closed"] = False
+        reconcile = command("respond", dict(reply, action_id=action))
+        self.store.execute(reconcile)
+        request = self.store.get_run("example")["attempt"]["prepared_request"]
+        self.assertEqual(request, reply["response"]["request"])
+        submit = self.queue("submit")
+        effects = []
+        def invoke(payload):
+            effects.append(payload)
+            return {"response": {"accepted": True}, "call_closed": True}
+        self.error("PENDING", self.store.perform, submit, self.spec["binding"], invoke)
+        self.store.execute(command("close_call", {"action_id": action, "evidence_ref": "demo:old-call-closed"}))
+        self.store.perform(submit, self.spec["binding"], invoke)
+        self.assertEqual(effects, [request])
+        self.error("PENDING", self.store.perform, action, self.spec["binding"], lost)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(self.store.execute(reconcile)["replayed"])
+        # The old failure receipt remains historical and cannot overwrite READY.
+        failure = command("respond", {"action_id": action, "response": original["response"],
+                                      "call_closed": False}, "response:" + action)
+        self.assertTrue(self.store.execute(failure)["replayed"])
+        self.assertEqual(self.store.get_action(action)["response"], reply["response"])
+        with sqlite3.connect(self.path / "runs.sqlite") as db:
+            responses = [json.loads(row[0])["response"] for row in db.execute(
+                "SELECT body FROM events WHERE operation='respond' ORDER BY seq")]
+        self.assertEqual(responses[:2], [original["response"], reply["response"]])
+
+    def test_delayed_nonstart_after_transport_failure_refunds_only_original_call(self):
+        for kind in ("prepare", "submit", "query", "cancel"):
+            with self.subTest(kind=kind):
+                path = self.root / ("late-proof-" + kind)
+                self.store = initialize(path)
+                self.store.execute(command("create", self.spec))
+                self.prepare()
+                if kind == "cancel":
+                    submit = self.queue("submit")
+                    self.store.perform(submit, self.spec["binding"],
+                                       lambda p: {"response": {"accepted": True}, "call_closed": True})
+                    self.store.execute(command("cancel", {"run_id": "example", "reason": "Synthetic stop"}))
+                before = self.store.get_run("example")
+                action = self.queue(kind)
+                def lost(payload):
+                    raise OSError("Synthetic adapter failure before classifying startup")
+                self.error("CALL_UNKNOWN", self.store.perform, action, self.spec["binding"], lost)
+                failure = self.store.get_action(action)
+                if kind == "submit":
+                    self.store.execute(command("observe", self.observation("UNKNOWN", False, "NOT_FOUND")))
+                proof = command("not_started", {"action_id": action, "evidence_ref": "demo:later-verified-no-process"})
+                self.store.execute(proof)
+                self.store = open_store(path)
+                current = self.store.get_run("example")
+                self.assertEqual(current["counters"], before["counters"])
+                self.assertEqual(current["attempt"]["prepared_request"], before["attempt"]["prepared_request"])
+                self.assertEqual(current["attempt"]["submission_recorded"], before["attempt"]["submission_recorded"])
+                self.assertEqual(current["cancel"], before["cancel"])
+                self.assertEqual(self.store.get_action(action)["state"], "NOT_SENT")
+                self.assertTrue(self.store.execute(proof)["replayed"])
+                self.assertEqual(self.store.get_run("example")["counters"], before["counters"])
+                with sqlite3.connect(path / "runs.sqlite") as db:
+                    retained = db.execute("SELECT body FROM events WHERE operation='respond' AND json_extract(body,'$.action_id')=?", (action,)).fetchone()
+                self.assertEqual(json.loads(retained[0])["response"], failure["response"])
+                self.error("PENDING", self.store.perform, action, self.spec["binding"], lost)
+
+    def test_late_recovered_ready_cannot_supersede_newer_preparation(self):
+        for next_state in ("READY", "FAILED", "PREPARING"):
+            with self.subTest(next_state=next_state):
+                path = self.root / ("late-ready-" + next_state)
+                self.store = initialize(path)
+                self.store.execute(command("create", self.spec))
+                old = self.queue("prepare")
+                def lost(payload):
+                    raise TimeoutError()
+                self.error("CALL_UNKNOWN", self.store.perform, old, self.spec["binding"], lost)
+                self.store.execute(command("close_call", {"action_id": old, "evidence_ref": "demo:old-call-exited"}))
+                newer = self.queue("prepare")
+                if next_state == "READY":
+                    def next_ready(payload):
+                        result = ready(payload)
+                        request = result["response"]["request"]
+                        request["expires_at"] += 60
+                        request["request_digest"] = hashlib.sha256(canonical({k:v for k,v in request.items() if k != "request_digest"})).hexdigest()
+                        return result
+                    self.store.perform(newer, self.spec["binding"], next_ready)
+                else:
+                    self.store.perform(newer, self.spec["binding"],
+                                       lambda p: {"response": {"state": next_state}, "call_closed": True})
+                current = self.store.get_run("example")["attempt"]["prepared_request"]
+                reply = ready(self.store.get_action(old)["payload"])
+                self.error("CONFLICT", self.store.execute,
+                           command("respond", dict(reply, action_id=old, call_closed=False)))
+                self.assertEqual(self.store.get_run("example")["attempt"]["prepared_request"], current)
+                self.store.execute(command("respond", dict(reply, action_id=old)))
+                self.assertEqual(self.store.get_run("example")["attempt"]["prepared_request"], current)
+                self.assertEqual(self.store.get_action(old)["response"], reply["response"])
+                if next_state == "READY":
+                    queued = self.queue("submit")
+                    self.assertEqual(self.store.get_action(queued)["payload"], current)
+                else:
+                    self.error("NOT_READY", self.queue, "submit")
+
+    def test_confirmed_responses_cannot_be_replaced_or_refunded(self):
+        for response in ({"accepted": True}, {"state": "FAILED"}, {"state": "PREPARING"},
+                         {"transport_error": "TimeoutError", "remote_detail": "A real response"}):
+            with self.subTest(response=response):
+                action = self.queue("query")
+                self.store.perform(action, self.spec["binding"], lambda p: {"response": response, "call_closed": True})
+                before = (self.path / "runs.sqlite").read_bytes()
+                self.error("CONFLICT", self.store.execute, command("not_started", {"action_id": action, "evidence_ref": "demo:contradictory-proof"}))
+                self.error("CONFLICT", self.store.execute, command("respond", {"action_id": action, "response": {}, "call_closed": True}))
+                self.assertEqual((self.path / "runs.sqlite").read_bytes(), before)
+
+    def test_delayed_nonstart_cannot_erase_observed_execution(self):
+        self.prepare()
+        action = self.queue("submit")
+        def lost(payload):
+            raise TimeoutError()
+        self.error("CALL_UNKNOWN", self.store.perform, action, self.spec["binding"], lost)
+        self.store.execute(command("observe", self.observation("UNKNOWN", False, "RUNNING")))
+        self.store.execute(command("observe", self.observation("UNKNOWN", False, "NOT_FOUND")))
+        before = (self.path / "runs.sqlite").read_bytes()
+        self.error("CONFLICT", self.store.execute, command("not_started", {"action_id": action,
+                                                         "evidence_ref": "demo:contradictory-late-proof"}))
+        self.assertEqual((self.path / "runs.sqlite").read_bytes(), before)
+        self.assertEqual(self.store.get_run("example")["counters"]["attempts"], 1)
+        self.assertTrue(self.store.get_run("example")["attempt"]["submission_recorded"])
+
+    def test_recovered_response_commit_failure_retains_atomic_history_and_readiness(self):
+        real_connect = sqlite3.connect
+        for committed in (False, True):
+            with self.subTest(committed=committed):
+                path = self.root / ("response-commit-" + str(committed))
+                self.store = initialize(path)
+                self.store.execute(command("create", self.spec))
+                action = self.queue("prepare")
+                def lost(payload):
+                    raise TimeoutError()
+                self.error("CALL_UNKNOWN", self.store.perform, action, self.spec["binding"], lost)
+                old_action = self.store.get_action(action)
+                old_run = self.store.get_run("example")
+                reply = ready(old_action["payload"])
+                request = command("respond", dict(reply, action_id=action))
+                class Connection(sqlite3.Connection):
+                    def commit(self):
+                        if committed:
+                            super().commit()
+                        raise sqlite3.OperationalError("synthetic recovered response commit failure")
+                with patch("control_production_plane.store.sqlite3.connect",
+                           side_effect=lambda *a, **k: real_connect(*a, **k, factory=Connection)):
+                    error = self.error("STORAGE_ERROR", self.store.execute, request)
+                self.assertEqual(error.commit_state, "unknown")
+                self.store = open_store(path)
+                if committed:
+                    self.assertEqual(self.store.get_run("example")["attempt"]["prepared_request"], reply["response"]["request"])
+                    self.assertEqual(self.store.get_action(action)["response"], reply["response"])
+                else:
+                    self.assertEqual(self.store.get_run("example"), old_run)
+                    self.assertEqual(self.store.get_action(action), old_action)
+                result = self.store.execute(request)
+                self.assertEqual(result["replayed"], committed)
+                self.assertTrue(self.store.execute(request)["replayed"])
+                self.assertEqual(self.store.get_run("example")["counters"], old_run["counters"])
+                self.assertEqual(self.store.get_action(action)["response"], reply["response"])
+
     def test_duplicate_perform_and_forked_or_expired_lease_cannot_dispatch(self):
         action = self.prepare()
         calls = []

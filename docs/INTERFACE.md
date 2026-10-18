@@ -81,7 +81,7 @@ store = initialize("/absolute/private/new-control-store")
 | `revise` | `run_id`、`expected_revision`、`plan`；提交前或原执行已退出且失败后可修正，旧调用需闭合；产生新尝试和原任务 ID，保留旧记录 |
 | `queue` | `run_id`、`attempt_id`、`action_id`、`kind`；kind 为 `prepare`、`submit`、`query` 或 `cancel`，参数由保存的计划/请求生成 |
 | `dispatch` | `action_id`、`observed_binding`；记录可能已下发；准备/提交要求有效执行 lease。仅供库的适配层使用，CLI 拒绝此命令 |
-| `respond` | `action_id`、`response`（对象）、`call_closed`（布尔值）；保存原响应；准备的 `READY` 需含完整 `request` |
+| `respond` | `action_id`、`response`（对象）、`call_closed`（布尔值）；保存原响应，或补记传输失败后核实的响应；准备的 `READY` 需含完整 `request` |
 | `close_call` | `action_id`、`evidence_ref`；已记录响应后，凭已核对的进程退出/流完成证据补记调用闭合 |
 | `observe` | `run_id`、`attempt_id`、`operation_id`、`request_digest`、`remote_state`、`outcome`、`exited`、`evidence_state`、`evidence_ref` |
 | `abandon` | `action_id`、`reason`；只放弃尚未下发的 `QUEUED` 动作，不消耗业务额度 |
@@ -102,6 +102,10 @@ store = initialize("/absolute/private/new-control-store")
 `perform` 的 `preflight(payload)` 只做下发前检查；抛出 `ControlError` 会留档且不计调用额度。`invoke(payload)` 返回恰含 `response` 与 `call_closed` 的对象。它必须自行执行有限 I/O、完整协议验证和进程/双流跟踪；本版核心不监视适配器派生的子进程，也不保证回调超时后已经停止。
 
 适配器若证明连进程/传输都没有启动，可抛 `CallNotStarted(evidence_ref)`；核心保存失败并退还额度，同一任务可重新排队。普通异常按结果未知处理，保留调用缺口；不会因为异常类型是 `TimeoutError` 或 `OSError` 就推断无执行。
+
+普通异常保留为 `RESPONDED` 动作中的 `{"transport_error":"异常类型"}`；这个只有一个字符串字段的对象是核心保留的传输失败标记，不是已确认的远端响应，适配器不得用它包装已收到的业务结果。后续取得真实响应，可用新的本地 `request_id` 向原 `action_id` 提交 `respond`；取得明确未启动证明，则可提交 `not_started`。这两种接续只补记事实，不重新调用原动作。原失败事件和成功回执保留；已确认的普通响应不能替换。原回执重放不回写当前响应，也不再次退还额度。
+
+响应补记与额度退还仍是本地事务，提交返回 unknown 时沿原请求核对。补记响应仍受大小限制；准备 READY 继续核对当前尝试、原计划与请求摘要，且任务尚未提交。完整协议与外部身份仍由适配器核对。迟到的旧 READY 保存在原动作上，当前可提交请求按准备下发顺序重新判定，不能越过后来 FAILED、PREPARING 或新 READY。已记录的调用闭合不能改回未闭合；准备调用没有退出和双流证明时仍保留未闭合状态，阻止下一次准备或提交。
 
 提交意图落账后，并发查询可能先返回 `NOT_FOUND`。这项观察本身不退款、不允许重提；若随后取得独立的未启动证明，且同一尝试的当前观察和历史均没有运行、终态或证据已封存等矛盾事实，仍可记录证明并退还该次额度。原查询、请求和任务 ID 保留。曾观察到运行或终态后再查询不到，也不能据此退还额度；重复原证明只返回旧回执，不撤销后来已记录的提交。
 

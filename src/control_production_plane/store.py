@@ -541,22 +541,36 @@ class ControlStore:
         m.require(state["counters"][counter] < state["budget"][bound], "Persistent call budget exhausted", "LIMIT")
         state["counters"][counter] += 1
 
+    @staticmethod
+    def _awaiting_response(action):
+        # perform records an adapter exception in this reserved envelope. It
+        # preserves a transport failure, not a confirmed remote response.
+        response = action["response"]
+        return action["state"] == "MAY_HAVE_RUN" or (
+            action["state"] == "RESPONDED" and isinstance(response, dict)
+            and set(response) == {"transport_error"} and type(response["transport_error"]) is str)
+
     def _respond(self, db, body, lease):
         m.fields(body, "action_id response call_closed")
         m.require(type(body["response"]) is dict and type(body["call_closed"]) is bool, "Invalid response observation")
         action = self._action(db, body["action_id"])
         state = self._load(db, action["run_id"])
-        m.require(action["state"] == "MAY_HAVE_RUN", "Action has no outstanding response", "CONFLICT")
+        m.require(self._awaiting_response(action), "Action already has a confirmed response", "CONFLICT")
+        m.require(not action["call_closed"] or body["call_closed"], "Retained call closure cannot be undone", "CONFLICT")
         m.require(len(m.canonical(body["response"])) <= state["budget"]["max_response_bytes"], "Response exceeds budget", "LIMIT")
-        if action["kind"] == "prepare" and body["response"].get("state") == "READY":
+        is_ready = action["kind"] == "prepare" and body["response"].get("state") == "READY"
+        if is_ready:
             m.require(action["attempt_id"] == state["attempt"]["attempt_id"], "Prepared response belongs to older attempt", "CONFLICT")
             m.require(not state["attempt"]["submission_recorded"], "Cannot replace a submitted request", "CONFLICT")
             request = body["response"].get("request")
             m.prepared(request, state)
-            state["attempt"]["prepared_request"] = request
-            self._save(db, state)
         action.update(state="RESPONDED", response=body["response"], call_closed=body["call_closed"])
         self._save_action(db, action)
+        if is_ready:
+            # A recovered response can arrive after a later preparation. Retain
+            # it on its original action without replacing that later authority.
+            state["attempt"]["prepared_request"] = self._prepared_from_history(db, state)
+            self._save(db, state)
         return {"run_id": action["run_id"], "action_id": action["action_id"]}
 
     def _close_call(self, db, body, lease):
@@ -589,7 +603,7 @@ class ControlStore:
         m.identity(body["evidence_ref"])
         action = self._action(db, body["action_id"])
         state = self._load(db, action["run_id"])
-        m.require(action["state"] == "MAY_HAVE_RUN", "Call already has a result", "CONFLICT")
+        m.require(self._awaiting_response(action), "Call already has a confirmed response", "CONFLICT")
         m.require(action["attempt_id"] == state["attempt"]["attempt_id"], "Attempt changed", "CONFLICT")
         if action["kind"] == "submit":
             # A concurrent NOT_FOUND is not proof of execution or non-execution.
