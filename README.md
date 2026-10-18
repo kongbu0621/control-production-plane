@@ -18,13 +18,18 @@
 
 首版面向软件任务：调用方提供一个明确的单文件修改方案，在已登记项目的任务副本中执行固定验证，保存候选成果，再按指定版本取回供审查和验收。需要修复时，调用方提供修订方案，由控制组件在原目标和预算内继续协调。
 
-## 与 Local Hand、Ledger 的关系
+## 与其他组件的关系
 
-| 组件 | 主要责任 |
+下表说明计划中的协作关系。Local Hand 和 Ledger 已有实现；P 与 K 仍处于设计阶段，尚未完成这些接入。
+
+| 组件 | 主要职责与本仓关系 |
 | --- | --- |
-| **control-production-plane** | 协调目标、计划、执行、验证、修复与接续，关联成果及验收决定 |
-| [infra-local-hand](https://github.com/kongbu0621/infra-local-hand) | 在获准范围内执行任务，保存原执行状态，返回结果和封存证据 |
-| [infra-artifact-ledger](https://github.com/kongbu0621/infra-artifact-ledger) | 保存成果身份、版本、实际内容和来源关系，供调用方准确读回 |
+| **control-production-plane（P）** | 协调目标、计划、执行、验证、修复与接续，关联成果及验收决定 |
+| [infra-local-hand](https://github.com/kongbu0621/infra-local-hand) | 计划中的执行后端：P 通过其公共入口准备、提交、查询和取消任务；Local Hand 执行获准任务并返回原状态与封存证据 |
+| [infra-artifact-ledger](https://github.com/kongbu0621/infra-artifact-ledger) | 计划中的成果存储：P 经现有 `local-hand-archive` 保存成功封存的候选成果，按准确版本读回供审查；Ledger 保存内容与来源 |
+| [domain-operational-knowledge-core（K）](https://github.com/kongbu0621/domain-operational-knowledge-core) | 可选知识组件（设计中）：拟向 P 提供已准入的准确知识版本，接收有来源的学习候选与使用反馈；知识审查和状态管理留在 K |
+
+知识接入是可选能力；没有配置 K 时，P 的首版生产流程仍可独立推进，明确记录未使用知识，不伪造查询或回流成功。
 
 `control-` 表示生产控制职责；`infra-` 是 infrastructure 的缩写，表示跨项目通用的基础机制。名称按主要职责分类，可独立复用的组件不一定都属于 `infra-`。
 
