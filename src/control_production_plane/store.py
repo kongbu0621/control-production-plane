@@ -604,7 +604,10 @@ class ControlStore:
         action = self._action(db, body["action_id"])
         state = self._load(db, action["run_id"])
         m.require(self._awaiting_response(action), "Call already has a confirmed response", "CONFLICT")
-        m.require(action["attempt_id"] == state["attempt"]["attempt_id"], "Attempt changed", "CONFLICT")
+        same_attempt = action["attempt_id"] == state["attempt"]["attempt_id"]
+        # A closed preparation/query can receive a no-start proof after plan
+        # revision. Refund that call without changing the current task or READY.
+        m.require(same_attempt or action["kind"] in ("prepare", "query"), "Attempt changed", "CONFLICT")
         if action["kind"] == "submit":
             # A concurrent NOT_FOUND is not proof of execution or non-execution.
             # Accept an independent no-start proof only if it conflicts with no
@@ -627,7 +630,7 @@ class ControlStore:
         state["counters"][counter] -= 1
         action.update(state="NOT_SENT", call_closed=True, response={"local_failure": "CALL_NOT_STARTED", "evidence_ref": body["evidence_ref"]})
         self._save_action(db, action)
-        if action["kind"] == "prepare":
+        if action["kind"] == "prepare" and same_attempt:
             state["attempt"]["prepared_request"] = self._prepared_from_history(db, state)
         self._save(db, state)
         return {"run_id": action["run_id"], "action_id": action["action_id"], "state": "NOT_SENT"}

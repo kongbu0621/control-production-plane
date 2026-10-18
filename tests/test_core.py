@@ -838,6 +838,105 @@ sys.exit(72)
         self.assertEqual(self.store.get_run("example")["counters"]["attempts"], 1)
         self.assertTrue(self.store.get_run("example")["attempt"]["submission_recorded"])
 
+    def test_old_preparation_or_query_nonstart_refunds_without_changing_new_attempt(self):
+        for kind in ("prepare", "query"):
+            with self.subTest(kind=kind):
+                path = self.root / ("revised-proof-" + kind)
+                self.store = initialize(path)
+                spec = sample()
+                spec["budget"].update(max_attempts=1, max_actions=2, max_queries=1)
+                self.store.execute(command("create", spec))
+                action = self.queue(kind)
+                def lost(payload):
+                    raise TimeoutError()
+                self.error("CALL_UNKNOWN", self.store.perform, action, spec["binding"], lost)
+                self.store.execute(command("close_call", {"action_id": action, "evidence_ref": "demo:old-call-closed"}))
+                self.store.execute(command("revise", {"run_id": "example", "expected_revision": 1,
+                    "plan": dict(spec["plan"], content="print('revised')\n")}))
+                old_revision = self.store.get_revision("example", 1)
+                self.prepare()
+                current = self.store.get_run("example")
+                next_action = self.queue("submit" if kind == "prepare" else "query")
+                effects = []
+                def invoke(payload):
+                    effects.append(payload)
+                    return {"response": {"accepted": True}, "call_closed": True}
+                self.error("LIMIT", self.store.perform, next_action, spec["binding"], invoke)
+                self.assertEqual(effects, [])
+                proof = command("not_started", {"action_id": action, "evidence_ref": "demo:late-old-call-nonstart"})
+                self.store.execute(proof)
+                self.store = open_store(path)
+                expected = copy.deepcopy(current)
+                counter = "actions" if kind == "prepare" else "queries"
+                expected["counters"][counter] -= 1
+                self.assertEqual(self.store.get_run("example"), expected)
+                self.assertEqual(self.store.get_revision("example", 1), old_revision)
+                self.assertEqual(self.store.get_action(action)["state"], "NOT_SENT")
+                self.store.perform(next_action, spec["binding"], invoke)
+                self.assertEqual(len(effects), 1)
+                self.assertEqual(effects[0]["operation_id"], current["attempt"]["operation_id"])
+                after = self.store.get_run("example")
+                self.assertTrue(self.store.execute(proof)["replayed"])
+                self.error("CONFLICT", self.store.execute, command("not_started", proof["body"]))
+                self.assertEqual(self.store.get_run("example"), after)
+                self.assertEqual(self.store.get_revision("example", 1), old_revision)
+
+    def test_old_submit_nonstart_cannot_refund_or_clear_a_new_submission(self):
+        self.prepare()
+        old_submit = self.queue("submit")
+        def lost(payload):
+            raise TimeoutError()
+        self.error("CALL_UNKNOWN", self.store.perform, old_submit, self.spec["binding"], lost)
+        self.store.execute(command("observe", self.observation("FAILED")))
+        self.store.execute(command("close_call", {"action_id": old_submit, "evidence_ref": "demo:old-submit-closed"}))
+        self.store.execute(command("revise", {"run_id": "example", "expected_revision": 1,
+            "plan": dict(self.spec["plan"], content="print('new attempt')\n")}))
+        self.submit()
+        self.store.execute(command("cancel", {"run_id": "example", "reason": "Stop the current attempt"}))
+        before = (self.path / "runs.sqlite").read_bytes()
+        self.error("CONFLICT", self.store.execute, command("not_started", {"action_id": old_submit,
+            "evidence_ref": "demo:contradictory-old-submit-proof"}))
+        self.assertEqual((self.path / "runs.sqlite").read_bytes(), before)
+        current = self.store.get_run("example")
+        self.assertTrue(current["attempt"]["submission_recorded"])
+        self.assertEqual(current["counters"]["attempts"], 2)
+        self.assertIsNotNone(current["cancel"])
+
+    def test_old_query_refund_commit_failure_preserves_revision_and_replays_once(self):
+        real_connect = sqlite3.connect
+        for committed in (False, True):
+            with self.subTest(committed=committed):
+                path = self.root / ("old-proof-commit-" + str(committed))
+                self.store = initialize(path)
+                self.store.execute(command("create", self.spec))
+                action = self.queue("query")
+                def lost(payload):
+                    raise TimeoutError()
+                self.error("CALL_UNKNOWN", self.store.perform, action, self.spec["binding"], lost)
+                self.store.execute(command("close_call", {"action_id": action, "evidence_ref": "demo:closed-query"}))
+                self.store.execute(command("revise", {"run_id": "example", "expected_revision": 1, "plan": self.spec["plan"]}))
+                before = self.store.get_run("example")
+                history = self.store.get_revision("example", 1)
+                proof = command("not_started", {"action_id": action, "evidence_ref": "demo:old-query-nonstart"})
+                class Connection(sqlite3.Connection):
+                    def commit(self):
+                        if committed:
+                            super().commit()
+                        raise sqlite3.OperationalError("synthetic old query proof commit failure")
+                with patch("control_production_plane.store.sqlite3.connect",
+                           side_effect=lambda *a, **k: real_connect(*a, **k, factory=Connection)):
+                    error = self.error("STORAGE_ERROR", self.store.execute, proof)
+                self.assertEqual(error.commit_state, "unknown")
+                self.store = open_store(path)
+                current = self.store.get_run("example")
+                self.assertEqual(current["counters"]["queries"], 0 if committed else 1)
+                self.assertEqual(current["attempt"], before["attempt"])
+                self.assertEqual(self.store.get_action(action)["state"], "NOT_SENT" if committed else "RESPONDED")
+                self.assertEqual(self.store.execute(proof)["replayed"], committed)
+                self.assertTrue(self.store.execute(proof)["replayed"])
+                self.assertEqual(self.store.get_run("example")["counters"]["queries"], 0)
+                self.assertEqual(self.store.get_revision("example", 1), history)
+
     def test_recovered_response_commit_failure_retains_atomic_history_and_readiness(self):
         real_connect = sqlite3.connect
         for committed in (False, True):
