@@ -268,14 +268,21 @@ class ArtifactAdapter:
         m.identity(artifact_id); m.identity(version_id)
         output = Path(output).absolute()
         m.require(not output.exists(), "Read-back output must be new; retain earlier outputs", "ALREADY_EXISTS")
+        original = response_json(retained(self.root/state["attempt"]["attempt_id"]/'archive.json'))
+        receipt_path = self.root/state['attempt']['attempt_id']/'receipt.json'
+        try:
+            raw_receipt = retained(receipt_path)
+        except FileNotFoundError:
+            receipt = None  # Legacy absence only; invalid files must not bypass the binding.
+        else:
+            receipt = _receipt_binding(state, response_json(raw_receipt))
+            m.require(receipt['artifact_id'] == artifact_id and receipt['version_id'] == version_id,
+                      "Requested version differs from the confirmed archive receipt", "IDENTITY_CONFLICT")
         call_id = "read-" + str(uuid.uuid4())
         result = self._call(["read", "--store", self.archive_store, "--artifact-id", artifact_id,
                             "--version-id", version_id, "--output", str(output)], call_id)
         m.require(result.get("artifact_id") == artifact_id and result.get("version_id") == version_id,
                   "Read-back version differs", "IDENTITY_CONFLICT")
-        original = response_json(retained(self.root/state["attempt"]["attempt_id"]/'archive.json'))
-        receipt_path = self.root/state['attempt']['attempt_id']/'receipt.json'
-        receipt = response_json(retained(receipt_path)) if receipt_path.exists() else None
         checked = verify_readback(state, result, output, original["evidence"], receipt)
         body = dict(run_id=run_id, attempt_id=state["attempt"]["attempt_id"], artifact_id=artifact_id,
                     version_id=version_id, source=checked["source"], readback_ref="cli:" + call_id,

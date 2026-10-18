@@ -557,6 +557,107 @@ class AdapterTests(unittest.TestCase):
         with self.assertRaises(ControlError):
             verify_readback(state, changed, self.root/'receipt-read', evidence, receipt)
 
+    def test_broken_receipt_link_cannot_fall_back_to_legacy_readback(self):
+        _, archived = self.sealed()
+        state = self.store.get_run('example')
+        path = self.artifacts.root/state['attempt']['attempt_id']/'receipt.json'
+        saved = path.with_name('preserved-receipt.json'); path.rename(saved)
+        original = saved.read_bytes()
+        for target in ('missing-receipt.json', 'receipt.json', saved.name):
+            with self.subTest(target=target):
+                path.symlink_to(target)
+                output = self.root/('invalid-link-read-'+str(uuid.uuid4()))
+                try:
+                    with patch.object(self.artifacts.calls, 'run', wraps=self.artifacts.calls.run) as run:
+                        with self.assertRaises((OSError, ControlError)):
+                            self.artifacts.read('example', artifact_id=archived['artifact_id'],
+                                version_id=archived['version_id'], output=output)
+                        run.assert_not_called()
+                    self.assertFalse(output.exists())
+                    self.assertEqual(self.store.get_run('example'), state)
+                    self.assertEqual(saved.read_bytes(), original)
+                finally:
+                    path.unlink()
+        saved.rename(path)
+        read = self.artifacts.read('example', artifact_id=archived['artifact_id'],
+            version_id=archived['version_id'], output=self.root/'restored-receipt-read')
+        self.assertEqual(read['files'], archived['files'])
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(sum(r['tool']=='lh_job_submit' for r in self.requests), 1)
+
+    def test_invalid_receipt_is_rejected_before_public_read(self):
+        _, archived = self.sealed()
+        state = self.store.get_run('example')
+        path = self.artifacts.root/state['attempt']['attempt_id']/'receipt.json'
+        saved = path.with_name('preserved-receipt.json'); path.rename(saved)
+        original = saved.read_bytes(); binding = response_json(original)
+        bad_digest = copy.deepcopy(binding); bad_digest['files']['status.json']['sha256'] = 'invalid'
+        bad_size = copy.deepcopy(binding); bad_size['files']['status.json']['size'] = True
+        cases = [('directory',None), ('fifo',None), ('public-permissions',original),
+                 ('invalid-json',b'{'), ('missing-fields',b'{}'),
+                 ('invalid-digest',model.canonical(bad_digest)), ('invalid-size',model.canonical(bad_size)),
+                 ('wrong-task',model.canonical(dict(binding,operation_id=str(uuid.uuid4())))),
+                 ('oversized',b' '*(512*1024+1))]
+        calls = set(self.artifacts.calls.root.iterdir())
+        for label, raw in cases:
+            with self.subTest(label=label):
+                if label == 'directory': path.mkdir(mode=0o700)
+                elif label == 'fifo': os.mkfifo(path,0o600)
+                else:
+                    publish(path,raw)
+                    if label == 'public-permissions': path.chmod(0o644)
+                output = self.root/('invalid-receipt-'+label)
+                try:
+                    with patch.object(self.artifacts.calls,'run',wraps=self.artifacts.calls.run) as run:
+                        with self.assertRaises((OSError,ControlError)):
+                            self.artifacts.read('example',artifact_id=archived['artifact_id'],
+                                version_id=archived['version_id'],output=output)
+                        run.assert_not_called()
+                    self.assertFalse(output.exists())
+                    self.assertEqual(set(self.artifacts.calls.root.iterdir()),calls)
+                    self.assertEqual(self.store.get_run('example'),state)
+                finally:
+                    path.rmdir() if label == 'directory' else path.unlink()
+        saved.rename(path)
+        for field in ('artifact_id','version_id'):
+            ids={k:archived[k] for k in ('artifact_id','version_id')};ids[field]=str(uuid.uuid4())
+            with self.subTest(field=field), patch.object(self.artifacts.calls,'run',wraps=self.artifacts.calls.run) as run:
+                with self.assertRaises(ControlError) as error:
+                    self.artifacts.read('example',**ids,output=self.root/('wrong-'+field))
+                self.assertEqual(error.exception.code,'IDENTITY_CONFLICT')
+                run.assert_not_called()
+        read=self.artifacts.read('example',artifact_id=archived['artifact_id'],
+            version_id=archived['version_id'],output=self.root/'valid-receipt-read')
+        self.assertEqual(read['files'],archived['files'])
+        self.assertEqual(path.read_bytes(),original)
+
+    def test_legacy_receipt_absence_does_not_hide_read_permission_errors(self):
+        _, archived = self.sealed()
+        state=self.store.get_run('example')
+        path=self.artifacts.root/state['attempt']['attempt_id']/'receipt.json'
+        saved=path.with_name('preserved-receipt.json');path.rename(saved)
+        self.artifacts.read('example',artifact_id=archived['artifact_id'],
+            version_id=archived['version_id'],output=self.root/'legacy-absent-receipt-read')
+        self.assertFalse(path.exists())
+        saved.rename(path)
+        state=self.store.get_run('example');original=path.read_bytes()
+        def denied(target,*args,**kwargs):
+            if target == path: raise PermissionError('Synthetic unreadable receipt')
+            return retained(target,*args,**kwargs)
+        with patch('control_production_plane.artifacts.retained',side_effect=denied), \
+                patch.object(self.artifacts.calls,'run',wraps=self.artifacts.calls.run) as run:
+            with self.assertRaises(PermissionError):
+                self.artifacts.read('example',artifact_id=archived['artifact_id'],
+                    version_id=archived['version_id'],output=self.root/'denied-receipt-read')
+            run.assert_not_called()
+        self.assertFalse((self.root/'denied-receipt-read').exists())
+        self.assertEqual(self.store.get_run('example'),state)
+        self.assertEqual(path.read_bytes(),original)
+        self.artifacts.read('example',artifact_id=archived['artifact_id'],
+            version_id=archived['version_id'],output=self.root/'permission-restored-read')
+        self.assertEqual(self.store.get_run('example')['attempt']['candidate'],state['attempt']['candidate'])
+        self.assertEqual(sum(r['tool']=='lh_job_submit' for r in self.requests),1)
+
     def test_interrupted_receipt_publication_recovers_from_retained_cli_result(self):
         evidence = self.unarchived_evidence()
         real = publish
