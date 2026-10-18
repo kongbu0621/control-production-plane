@@ -11,6 +11,25 @@ from . import model as m
 from .calls import CliCalls, private_directory, publish, retained, response_json, sha
 
 
+ARCHIVE_FILES = {"evidence.zip", "evidence.manifest", "evidence.seal", "status.json", "source.json"}
+
+
+def _receipt_binding(state, value):
+    """A public archive receipt pins the retained snapshot, including its bytes."""
+    m.fields(value, "artifact_id version_id producer operation_id files")
+    m.require(value['operation_id'] == state['attempt']['operation_id']
+              and value['producer'] == state['binding']['producer'],
+              "Archive receipt binding differs", "IDENTITY_CONFLICT")
+    m.identity(value['artifact_id']); m.identity(value['version_id'])
+    m.require(type(value['files']) is dict and set(value['files']) == ARCHIVE_FILES,
+              "Archive receipt file list differs", "PROTOCOL_ERROR")
+    for name, metadata in value['files'].items():
+        m.fields(metadata, "size sha256")
+        m.natural(metadata['size'], low=1, high=16*1024*1024 if name.endswith('.zip') else 4*1024*1024)
+        m.sha(metadata['sha256'])
+    return value
+
+
 def _evidence_description(value):
     """Validate and detach caller input before retaining an immutable intent."""
     m.validate_tree(value)
@@ -48,13 +67,13 @@ def _check_initial_status(state, evidence):
         "Initial status does not confirm task exit", "NOT_READY")
 
 
-def verify_readback(state, reply, directory, trusted):
+def verify_readback(state, reply, directory, trusted, receipt=None):
     """Validate the bytes actually consumed, not just a CLI success flag."""
     from local_hand_jobs.evidence_client import verify_local_bundle
     root = private_directory(directory, create=False)
     m.require(reply.get("status") == "READ" and reply.get("content_verified") is True,
               "Archive read did not confirm content", "PROTOCOL_ERROR")
-    expected = {"evidence.zip", "evidence.manifest", "evidence.seal", "status.json", "source.json"}
+    expected = ARCHIVE_FILES
     m.require(type(reply.get("files")) is dict and set(reply["files"]) == expected,
               "Read-back file list differs", "PROTOCOL_ERROR")
     files = {}
@@ -64,7 +83,16 @@ def verify_readback(state, reply, directory, trusted):
                   "Read-back bytes changed", "IDENTITY_CONFLICT")
         files[name] = raw
     source, status = response_json(files["source.json"]), response_json(files["status.json"])
-    m.require(source.get("status_sha256") == trusted["status_sha256"]
+    status_digest = trusted['status_sha256']
+    if receipt is not None:
+        receipt = _receipt_binding(state, receipt)
+        m.require(all(reply.get(k) == receipt[k] for k in ('artifact_id', 'version_id', 'files')),
+                  "Read-back differs from the confirmed archive receipt", "IDENTITY_CONFLICT")
+        # The public archive may reuse an earlier observation of this task.
+        # Its receipt pins those original bytes; the current authenticated seal
+        # and the exact task/request/content checks below still apply.
+        status_digest = receipt['files']['status.json']['sha256']
+    m.require(source.get("status_sha256") == status_digest
               and all(source.get(k) == trusted["seal"][k] for k in ("seal_id", "seal_sha256")),
               "Read-back differs from the originally authenticated status and seal", "IDENTITY_CONFLICT")
     attempt, plan = state["attempt"], state["plan"]
@@ -185,7 +213,14 @@ class ArtifactAdapter:
                   and result.get("producer") == state["binding"]["producer"]
                   and result.get("content_verified") is True,
                   "Archive receipt identity or verification differs", "IDENTITY_CONFLICT")
-        m.identity(result.get("artifact_id")); m.identity(result.get("version_id"))
+        binding = _receipt_binding(state, {key:result.get(key) for key in (
+            'artifact_id', 'version_id', 'producer', 'operation_id', 'files')})
+        path = self.root/state['attempt']['attempt_id']/'receipt.json'
+        raw = m.canonical(binding)
+        if path.exists():
+            m.require(retained(path) == raw, "Confirmed archive receipt changed", "IDENTITY_CONFLICT")
+        else:
+            publish(path, raw)
         return result
 
     @serial
@@ -239,7 +274,9 @@ class ArtifactAdapter:
         m.require(result.get("artifact_id") == artifact_id and result.get("version_id") == version_id,
                   "Read-back version differs", "IDENTITY_CONFLICT")
         original = response_json(retained(self.root/state["attempt"]["attempt_id"]/'archive.json'))
-        checked = verify_readback(state, result, output, original["evidence"])
+        receipt_path = self.root/state['attempt']['attempt_id']/'receipt.json'
+        receipt = response_json(retained(receipt_path)) if receipt_path.exists() else None
+        checked = verify_readback(state, result, output, original["evidence"], receipt)
         body = dict(run_id=run_id, attempt_id=state["attempt"]["attempt_id"], artifact_id=artifact_id,
                     version_id=version_id, source=checked["source"], readback_ref="cli:" + call_id,
                     receipt_sha256=m.digest(checked))

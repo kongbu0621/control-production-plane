@@ -99,7 +99,7 @@ store = initialize("/absolute/private/new-control-store")
 
 ## 候选、使用记录与决定
 
-`candidate.source` 是公共归档读回的 `lh-artifact-source-v1`，包含 producer、operation_id、request_digest、status_sha256、seal_id、seal_sha256 和 workspace。核心核对它与当前尝试及计划的对应关系；`ArtifactAdapter.read` 还读取真实文件、校验原认证状态和 seal、前后内容摘要、补丁及固定验证结果。核心接受受信操作者的明确记录，不把该接口当作防止同一用户伪造证据的鉴权系统。
+`candidate.source` 是公共归档读回的 `lh-artifact-source-v1`，包含 producer、operation_id、request_digest、status_sha256、seal_id、seal_sha256 和 workspace。核心核对它与当前尝试及计划的对应关系；`ArtifactAdapter.read` 还读取真实文件，核对归档回执的准确版本和文件摘要、原任务及认证 seal、前后内容、补丁与固定验证结果。status_sha256 指归档保留的状态快照；后续认证查询可能产生不同的观察摘要，两者不互相覆盖。旧记录的摘要核对及回执接续见[适配器说明](ADAPTERS.md)。核心接受受信操作者的明确记录，不把该接口当作防止同一用户伪造证据的鉴权系统。
 
 候选要求观察为已退出、成功且已封存。当前适配器只接纳可无歧义核对 Git porcelain 的 ASCII 路径（字母、数字、`_./-`）；额外源码变更、补丁变化或内容不等于计划均拒绝。`receipt_sha256` 是实际核对过的 source、文件清单、消费后内容摘要和补丁摘要组成对象的规范化 SHA-256。
 

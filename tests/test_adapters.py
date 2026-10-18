@@ -480,6 +480,130 @@ class AdapterTests(unittest.TestCase):
             evidence, _ = self.sealed()
         return evidence
 
+    def test_existing_archive_keeps_first_snapshot_after_later_status_query(self):
+        evidence = self.unarchived_evidence()
+        # An earlier public-CLI archive already owns this producer/operation.
+        args = self.artifacts.command + ['archive', '--store', self.artifacts.archive_store,
+            '--producer', self.spec['binding']['producer'],
+            '--status', str(Path(evidence['directory'])/'status.json'),
+            '--status-sha256', evidence['status_sha256'], '--evidence-dir', evidence['directory']]
+        result = subprocess.run(args, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        original = response_json(result.stdout)
+        self.status['observed_at'] = 2.5
+        later = self.adapter.download(self.perform('query'), self.root/'later-download')
+        self.assertNotEqual(evidence['status_sha256'], later['status_sha256'])
+        self.assertEqual(evidence['seal'], later['seal'])
+        recovered = self.artifacts.archive('example', later)
+        self.assertTrue(recovered['reused'])
+        self.assertEqual(recovered['artifact_id'], original['artifact_id'])
+        self.assertEqual(recovered['version_id'], original['version_id'])
+        self.assertEqual(recovered['files'], original['files'])
+        for description in (evidence, later):
+            for name in ('status.json', 'evidence.zip', 'evidence.manifest', 'evidence.seal'):
+                (Path(description['directory'])/name).unlink()
+        resumed = self.artifacts.resume('example')
+        self.assertEqual(resumed['files'], original['files'])
+        read = self.artifacts.read('example', artifact_id=recovered['artifact_id'],
+            version_id=recovered['version_id'], output=self.root/'earlier-snapshot-read')
+        self.assertEqual(read['source']['status_sha256'], evidence['status_sha256'])
+        self.assertEqual(read['files'], original['files'])
+        self.assertEqual(sum(r['tool']=='lh_job_submit' for r in self.requests), 1)
+
+    def test_confirmed_archive_receipt_cannot_change_on_resume(self):
+        _, archived = self.sealed()
+        attempt = self.store.get_run('example')['attempt']['attempt_id']
+        path = self.artifacts.root/attempt/'receipt.json'
+        original = path.read_bytes()
+        self.artifacts.resume('example')
+        self.assertEqual(path.read_bytes(), original)
+        changed_files = copy.deepcopy(archived['files'])
+        changed_files['status.json']['sha256'] = '0'*64
+        for change in ({'version_id':str(uuid.uuid4())}, {'artifact_id':str(uuid.uuid4())},
+                       {'files':changed_files}, {'files':{}},
+                       {'producer':'another-producer'}, {'operation_id':str(uuid.uuid4())}):
+            with self.subTest(change=change), patch.object(self.artifacts, '_call', return_value=dict(archived, **change)):
+                with self.assertRaises(ControlError):
+                    self.artifacts.resume('example')
+                self.assertEqual(path.read_bytes(), original)
+
+    def test_readback_receipt_cannot_replace_trusted_task_or_seal(self):
+        evidence, archived = self.sealed()
+        read = self.artifacts.read('example', artifact_id=archived['artifact_id'],
+            version_id=archived['version_id'], output=self.root/'receipt-read')
+        state = self.store.get_run('example')
+        receipt = response_json(retained(self.artifacts.root/state['attempt']['attempt_id']/'receipt.json'))
+        wrong_seal = copy.deepcopy(evidence); wrong_seal['seal']['seal_sha256'] = '0'*64
+        wrong_task = copy.deepcopy(state); wrong_task['attempt']['operation_id'] = str(uuid.uuid4())
+        wrong_request = copy.deepcopy(state); wrong_request['attempt']['prepared_request']['request_digest'] = '0'*64
+        wrong_plan = copy.deepcopy(state); wrong_plan['plan']['content'] = 'Other content'
+        changed_version = dict(read, version_id=str(uuid.uuid4()))
+        for current, trusted, result in ((state,wrong_seal,read), (wrong_task,evidence,read),
+                (wrong_request,evidence,read), (wrong_plan,evidence,read), (state,evidence,changed_version)):
+            with self.subTest(state=current, trusted=trusted), self.assertRaises(ControlError):
+                verify_readback(current, result, self.root/'receipt-read', trusted, receipt)
+        # A self-consistent status/source rewrite must still fail the pinned
+        # receipt even when the reply hashes agree with the rewritten files.
+        changed = copy.deepcopy(read)
+        status = response_json(retained(self.root/'receipt-read/status.json'))
+        status['observed_at'] = 99.5
+        raw = model.canonical(status)
+        (self.root/'receipt-read/status.json').write_bytes(raw)
+        changed['files']['status.json'] = dict(size=len(raw),sha256=hashlib.sha256(raw).hexdigest())
+        changed['source']['status_sha256'] = hashlib.sha256(raw).hexdigest()
+        raw = model.canonical(changed['source'])
+        (self.root/'receipt-read/source.json').write_bytes(raw)
+        changed['files']['source.json'] = dict(size=len(raw),sha256=hashlib.sha256(raw).hexdigest())
+        with self.assertRaises(ControlError):
+            verify_readback(state, changed, self.root/'receipt-read', evidence, receipt)
+
+    def test_interrupted_receipt_publication_recovers_from_retained_cli_result(self):
+        evidence = self.unarchived_evidence()
+        real = publish
+        def interrupted(path, raw):
+            if path.name == 'receipt.json':
+                raise OSError('Synthetic interruption after archive CLI completion')
+            return real(path, raw)
+        with patch('control_production_plane.artifacts.publish', side_effect=interrupted), self.assertRaises(OSError):
+            self.artifacts.archive('example', evidence)
+        attempt = self.store.get_run('example')['attempt']['attempt_id']
+        call = self.artifacts.calls.root/('archive-'+attempt)
+        original = {p.name:p.read_bytes() for p in call.iterdir()}
+        self.assertTrue(response_json(retained(call/'result.json'))['call_closed'])
+        with patch.object(self.artifacts.calls, 'run', wraps=self.artifacts.calls.run) as run:
+            recovered = self.artifacts.archive('example', evidence)
+            run.assert_not_called()
+        self.assertEqual({p.name:p.read_bytes() for p in call.iterdir()}, original)
+        self.assertTrue((self.artifacts.root/attempt/'receipt.json').exists())
+        self.artifacts.read('example', artifact_id=recovered['artifact_id'],
+            version_id=recovered['version_id'], output=self.root/'interrupted-receipt-read')
+        self.assertEqual(sum(r['tool']=='lh_job_submit' for r in self.requests), 1)
+
+    def test_status_change_after_preflight_does_not_rebind_archive(self):
+        evidence = self.unarchived_evidence()
+        path = Path(evidence['directory'])/'status.json'
+        original_status = path.read_bytes()
+        changed = response_json(original_status); changed['observed_at'] = 2.5
+        original_run = self.artifacts.calls.run
+        def change_input(argv, **kwargs):
+            path.write_bytes(model.canonical(changed))
+            try:
+                return original_run(argv, **kwargs)
+            finally:
+                path.write_bytes(original_status)
+        with patch.object(self.artifacts.calls, 'run', side_effect=change_input), self.assertRaises(ControlError):
+            self.artifacts.archive('example', evidence)
+        self.assertFalse(Path(self.artifacts.archive_store).exists())
+        attempt = self.store.get_run('example')['attempt']['attempt_id']
+        self.assertFalse((self.artifacts.root/attempt/'receipt.json').exists())
+        call = self.artifacts.calls.root/('archive-'+attempt)
+        failed = {p.name:p.read_bytes() for p in call.iterdir()}
+        recovered = self.artifacts.archive('example', evidence)
+        self.artifacts.read('example', artifact_id=recovered['artifact_id'],
+            version_id=recovered['version_id'], output=self.root/'changed-input-read')
+        self.assertEqual({p.name:p.read_bytes() for p in call.iterdir()}, failed)
+        self.assertEqual(sum(r['tool']=='lh_job_submit' for r in self.requests), 1)
+
     def test_invalid_evidence_description_cannot_freeze_first_archive_input(self):
         evidence = self.unarchived_evidence()
         cases = [None, [], dict(evidence, unexpected=True)]
