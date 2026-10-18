@@ -1,6 +1,6 @@
 # 维护与接续
 
-先读 [README](README.md)、[需求](docs/REQUIREMENTS.md)、[架构](docs/ARCHITECTURE.md)和[实施计划](docs/IMPLEMENTATION_PLAN.md)。当前已有 `0.1.0a1` 运行记录核心、库与 CLI；真实 Local Hand/Ledger 适配和现场生产任务尚未执行。实现字段见 [公共接口](docs/INTERFACE.md)，运行方式见[使用说明](docs/USAGE.md)。当前决定、来源基线和待办见[开发与接续记录](docs/DEVELOPMENT.md)。
+先读 [README](README.md)、[需求](docs/REQUIREMENTS.md)、[架构](docs/ARCHITECTURE.md)和[实施计划](docs/IMPLEMENTATION_PLAN.md)。当前已有 `0.1.0a2` 运行记录核心、库与 CLI，以及 Local Hand/Ledger 静态适配器；合成任务集成验证已完成，现场生产任务尚未验收。实现字段见 [公共接口](docs/INTERFACE.md)，运行方式见[使用说明](docs/USAGE.md)。当前决定、来源基线和待办见[开发与接续记录](docs/DEVELOPMENT.md)。
 
 ## 当前方向
 

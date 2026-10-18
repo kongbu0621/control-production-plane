@@ -1,17 +1,17 @@
 # 安装与本地记录使用
 
-当前交付运行记录核心；真实任务执行、归档与验收适配尚未完成。本指南的示例创建合成记录，不操作已部署的 Local Hand 或 Ledger。
+当前交付运行记录核心和可选执行/成果适配器。本页先介绍不会下发任务的本地记录示例；连接已有服务、归档、读回与验收见[适配器使用](ADAPTERS.md)。
 
 ## 构建与独立安装
 
-支持 Linux / Python 3.12。运行时仅依赖标准库。先从本仓取得源码，在源码目录创建独立构建环境：
+支持 Linux / Python 3.12。运行记录核心仅依赖标准库；使用适配器时另行安装所选 Local Hand 和 Ledger wheel。先从本仓取得源码，在源码目录创建独立构建环境：
 
 ```sh
 python3.12 -m venv .build-venv
 .build-venv/bin/python -m pip install setuptools==84.0.0 wheel==0.48.0
 .build-venv/bin/python -m pip wheel --no-build-isolation --no-deps . -w dist
 python3.12 -m venv /absolute/private/production-runtime
-/absolute/private/production-runtime/bin/python -m pip install --no-index --no-deps dist/control_production_plane-0.1.0a1-py3-none-any.whl
+/absolute/private/production-runtime/bin/python -m pip install --no-index --no-deps dist/control_production_plane-0.1.0a2-py3-none-any.whl
 ```
 
 有离线 wheel 缓存时，为构建依赖安装加 `--no-index --find-links /path/to/verified-wheelhouse`。不要复用其他项目的运行环境，也不要把运行数据放进源码目录。首次初始化只接受不存在的存储目录，其父目录需要已存在。
@@ -50,4 +50,4 @@ PYTHONPATH=src .build-venv/bin/python -m unittest discover -s tests -v
 .build-venv/bin/python -m compileall -q src examples tests
 ```
 
-安装态验证应离开源码工作目录并清除 `PYTHONPATH`，使用独立 runtime 的解释器，确认 `control_production_plane.__file__` 位于该环境的 `site-packages`，再运行本仓测试和示例。测试使用合成适配器，但包含实际 SQLite 事务、独立进程、中断、竞争、CLI 短写和回执输出失败；不能将其结果描述为真实 Local Hand/Ledger 接入或 A3 完成。
+安装态验证应离开源码工作目录并清除 `PYTHONPATH`，使用独立 runtime 的解释器，确认 `control_production_plane.__file__` 位于该环境的 `site-packages`，再运行本仓测试和示例。核心测试覆盖实际 SQLite 事务、独立进程、中断、竞争、CLI 短写和回执输出失败。`test_adapters` 在安装所选 Local Hand/Ledger 包后，使用合成 Unix 服务和真实 CLI、证据校验、Ledger 存储验证集成；缺少依赖时明确跳过这些集成测试。不得将合成任务结果报告成现场任务或 A3 完成。

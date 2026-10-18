@@ -1,6 +1,6 @@
 # 运行记录核心公共接口
 
-适用版本：`0.1.0a1`，命令 schema 为 `production-plane-v1`，本地存储格式为 `production-plane-store-v1`。这是首批本地核心接口；Local Hand、Ledger 的真实适配和成果验收尚未交付。
+适用版本：`0.1.0a2`，命令 schema 为 `production-plane-v1`，本地存储格式为 `production-plane-store-v1`。包含本地运行记录、静态 CLI 适配、候选及明确的验收决定；存储格式保持兼容，使用新功能后应继续用本版读取。
 
 ## 使用边界
 
@@ -8,7 +8,7 @@ Linux、Python 3.12、单个受信本地用户，在支持 SQLite 和文件锁�
 
 核心记录受信调用方提供的身份、准备结果和观察，不认证外部事实。实际调用前，适配器必须核对真实部署、权限、能力与完整请求 schema；`observed_binding` 不能由适配器不经核对地照抄。`evidence_ref` 是调用者维护的证据引用，存入字符串不证明证据真实或已下载。
 
-本版没有内置网络调用器、Local Hand CLI 子进程管理、证据下载、Ledger 归档和验收决定入口。库的 `perform` 是适配器调用边界；本地 CLI 只维护记录。不得把合成回执或本地恢复建议报告成现场执行成功。
+`LocalHandAdapter` 通过安装的公共 CLI 调用 Unix socket，管理有限的子进程、原始双流、证据下载和完整协议校验；`ArtifactAdapter` 调用公共归档 CLI 并核对实际读回内容。它们面向受信且不派生后台进程的所选 CLI。配置和新增命令见[适配器使用](ADAPTERS.md)；合成任务或本地恢复建议不是现场执行证明。
 
 ## Python 入口
 
@@ -79,7 +79,7 @@ store = initialize("/absolute/private/new-control-store")
 | --- | --- |
 | `cancel` | `run_id`、`reason`；记录停止继续推进的意图，不宣称远端退出 |
 | `revise` | `run_id`、`expected_revision`、`plan`；提交前或原执行已退出且失败后可修正，旧调用需闭合；产生新尝试和原任务 ID，保留旧记录 |
-| `queue` | `run_id`、`attempt_id`、`action_id`、`kind`；kind 为 `prepare`、`submit`、`query` 或 `cancel`，参数由保存的计划/请求生成 |
+| `queue` | `run_id`、`attempt_id`、`action_id`、`kind`；kind 为 `prepare`、`submit`、`query` 或 `cancel`。仅 prepare 可额外传 `retry_failed=true`，原任务和 inputs 不变 |
 | `dispatch` | `action_id`、`observed_binding`；记录可能已下发；准备/提交要求有效执行 lease。仅供库的适配层使用，CLI 拒绝此命令 |
 | `respond` | `action_id`、`response`（对象）、`call_closed`（布尔值）；保存原响应，或补记传输失败后核实的响应；准备的 `READY` 需含完整 `request` |
 | `close_call` | `action_id`、`evidence_ref`；已记录响应后，凭已核对的进程退出/流完成证据补记调用闭合 |
@@ -87,13 +87,25 @@ store = initialize("/absolute/private/new-control-store")
 | `abandon` | `action_id`、`reason`；只放弃尚未下发的 `QUEUED` 动作，不消耗业务额度 |
 | `preflight_failure` | `action_id`、`code`；保存下发前的本地校验失败，保留同一待发动作和额度 |
 | `not_started` | `action_id`、`evidence_ref`；仅限已证明调用未启动且无远端影响的失败，退还该次额度；超时/丢响应不得使用 |
+| `candidate` | `run_id`、`attempt_id`、`artifact_id`、`version_id`、`source`、`readback_ref`、`receipt_sha256`；记录经实际读回核对的成果 |
+| `decide` | `run_id`、`attempt_id`、`candidate_digest`、`actor`、`decision`、`checks`、`reason`；明确接受或拒绝当前候选 |
 | `learning_candidate` | `run_id`、`attempt_id`、`candidate_id`、`explanation`、`evidence_refs`、`artifact_versions` |
 
-`revise` 至多保存 100 个计划修订；提交前修正不消耗业务尝试额度。已取消运行不能继续提交或修订；未知提交不能通过修订换 ID 逃避核对。原任务成功但验收不通过后的修复，需后续验收入口实现；本版只允许确认执行失败后的业务修订。
+`revise` 至多保存 100 个计划修订；提交前修正不消耗业务尝试额度。已取消运行不能继续提交或修订；未知提交不能通过修订换 ID 逃避核对。原执行成功但当前候选已有明确 `REJECT` 决定时，也允许修订；已接受或尚未作决定的成功任务不能重做。旧候选、验收决定和使用记录随原修订保留。
 
 `observe` 的 `remote_state` 为 `NOT_FOUND`、`RUNNING`、`TERMINAL`；`outcome` 为 `UNKNOWN`、`SUCCEEDED`、`FAILED`、`CANCELLED`。非终态必须保持 UNKNOWN；`exited=true` 只允许终态。`evidence_state` 为 `UNKNOWN`、`STAGING`、`SEALED`，与业务结果分开。查询未找到不会释放原提交额度；取消请求不能覆盖先完成的业务结果。此接口保存适配器核对后的观察，不代替读取原始执行证据。
 
 学习候选自动绑定目标摘要、计划修订、执行任务和部署绑定，至少提供一项来源引用。`artifact_versions` 每项恰含 `artifact_id`、`version_id`。本版只保存本地候选，固定返回 `delivery=UNCONFIGURED`、`admission=NOT_REQUESTED`；同候选 ID 改内容拒绝，不假报已回流或已准入。
+
+## 候选、使用记录与决定
+
+`candidate.source` 是公共归档读回的 `lh-artifact-source-v1`，包含 producer、operation_id、request_digest、status_sha256、seal_id、seal_sha256 和 workspace。核心核对它与当前尝试及计划的对应关系；`ArtifactAdapter.read` 还读取真实文件、校验原认证状态和 seal、前后内容摘要、补丁及固定验证结果。核心接受受信操作者的明确记录，不把该接口当作防止同一用户伪造证据的鉴权系统。
+
+候选要求观察为已退出、成功且已封存。当前适配器只接纳可无歧义核对 Git porcelain 的 ASCII 路径（字母、数字、`_./-`）；额外源码变更、补丁变化或内容不等于计划均拒绝。`receipt_sha256` 是实际核对过的 source、文件清单、消费后内容摘要和补丁摘要组成对象的规范化 SHA-256。
+
+候选自动绑定 goal_digest 与 revision，`candidate_digest` 为候选整个对象的规范化摘要。相同候选再次读回会追加新的 readback_ref 使用事件，保持原候选身份和决定；不同候选不得覆盖。这里的 candidate 是**成果候选**，与 `learning_candidate` 知识候选不同。
+
+`decision` 为 `ACCEPT` 或 `REJECT`。`checks` 按原 goal.acceptance 顺序逐项包含 `{condition, passed, evidence_ref}`；不能遗漏或换掉条件，ACCEPT 要求全部通过。actor 和 reason 必填，决定绑定准确候选摘要与当前尝试。成功执行、归档或读回不会自动写 ACCEPT；同内容决定可幂等重放，旧决定不能套到新修订。
 
 ## 调用与恢复语义
 
@@ -113,7 +125,7 @@ store = initialize("/absolute/private/new-control-store")
 
 同一动作 ID 不会被 `perform` 再次调用。核心已记录可能提交后，本版不自动重发同一 submit；先查询原任务。准备响应未知时，真实适配器需核对原准备及旧调用状态，再记录响应/闭合，不能改用新 UUID 猜测结果。准备返回 `PREPARING` 后，新轮询动作仍保留同一任务及原 inputs。
 
-接收 `READY` 时校验操作 ID、任务类型、profile、inputs、有效期与请求摘要；保存完整请求，提交前原样取出。完整的 Local Hand schema、启动绑定和能力验证由后续真实适配器补齐；样例里的合成 READY 不是可下发的真实请求。
+接收 `READY` 时校验操作 ID、任务类型、profile、inputs、有效期与请求摘要；保存完整请求，提交前原样取出。完整的 Local Hand schema 由安装依赖验证，CLI 适配器还核对来源、能力、socket 服务身份及绑定配置；样例里的合成 READY 不是可下发的真实请求。
 
 新的准备动作一旦落下发意图，就清除当前可提交请求，等待该轮重新得到有效 `READY`；旧请求仍完整保存在原动作响应中。该轮返回 `PREPARING`、`FAILED`、调用中断或结果未知时，不能继续提交旧 READY。本地预检失败或下发事务回滚时，原请求保持不变。
 

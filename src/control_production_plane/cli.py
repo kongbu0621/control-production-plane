@@ -1,4 +1,4 @@
-"""Local record commands. No remote task execution or shell command entrypoint."""
+"""Local records and explicitly configured installed CLI adapters; never a shell."""
 import argparse
 import json
 import os
@@ -24,6 +24,25 @@ def main(argv=None):
             sub.add_argument("--limit", type=int, default=10)
     write = commands.add_parser("write")
     write.add_argument("--request", required=True, type=Path)
+    for name in ("inspect-executor", "execute-action", "reconcile-action", "collect-evidence"):
+        sub = commands.add_parser(name)
+        sub.add_argument("--adapter", required=True, type=Path)
+        sub.add_argument("--data", required=True, type=Path)
+        if name != "inspect-executor":
+            sub.add_argument("--action-id", required=True)
+        if name == "collect-evidence":
+            sub.add_argument("--output", required=True, type=Path)
+    for name in ("archive-result", "resume-archive", "read-artifact"):
+        sub = commands.add_parser(name)
+        sub.add_argument("--adapter", required=True, type=Path)
+        sub.add_argument("--data", required=True, type=Path)
+        sub.add_argument("--run-id", required=True)
+        if name == "archive-result":
+            sub.add_argument("--evidence", required=True, type=Path)
+        if name == "read-artifact":
+            sub.add_argument("--artifact-id", required=True)
+            sub.add_argument("--version-id", required=True)
+            sub.add_argument("--output", required=True, type=Path)
     args = parser.parse_args(argv)
     mutated = False
     try:
@@ -39,6 +58,33 @@ def main(argv=None):
                 data = store.recover(args.run_id)
             elif args.command == "events":
                 data = store.events(args.run_id, after=args.after, limit=args.limit)
+            elif args.command in ("inspect-executor", "execute-action", "reconcile-action", "collect-evidence"):
+                from .local_hand import LocalHandAdapter
+                from .calls import retained
+                adapter = LocalHandAdapter(store, decode(retained(args.adapter)), args.data)
+                if args.command == "inspect-executor":
+                    data = adapter.capabilities()
+                elif args.command == "execute-action":
+                    data = adapter.perform(args.action_id)
+                elif args.command == "reconcile-action":
+                    data = adapter.reconcile(args.action_id)
+                else:
+                    data = adapter.download(args.action_id, args.output)
+                mutated = True  # Includes retained local CLI/evidence records.
+            elif args.command in ("archive-result", "resume-archive", "read-artifact"):
+                from .artifacts import ArtifactAdapter
+                from .calls import retained
+                from .model import fields
+                config = decode(retained(args.adapter))
+                fields(config, "command archive_store")
+                adapter = ArtifactAdapter(store, config["command"], config["archive_store"], args.data)
+                if args.command == "archive-result":
+                    data = adapter.archive(args.run_id, decode(retained(args.evidence)))
+                elif args.command == "resume-archive":
+                    data = adapter.resume(args.run_id)
+                else:
+                    data = adapter.read(args.run_id, artifact_id=args.artifact_id, version_id=args.version_id, output=args.output)
+                mutated = True
             else:
                 with args.request.open("rb") as stream:
                     request = decode(stream.read(MAX_JSON + 1))
@@ -61,6 +107,11 @@ def main(argv=None):
     except (OSError, ValueError, RecursionError) as exc:
         error = {"code": "IO_ERROR", "message": "Local I/O failed; retain the original request and inspect records",
                  "commit_state": "committed" if mutated else "unknown"}
+    except Exception as exc:
+        # Optional adapters may expose dependency validation errors. Preserve an
+        # unknown outcome and return a bounded error, never a false rollback.
+        error = {"code": "ADAPTER_ERROR", "message": "Adapter response or dependency failed; inspect retained call records",
+                 "exception": type(exc).__name__, "commit_state": "unknown"}
     try:
         sys.stderr.write(json.dumps({"status": "ERROR", "error": error}, ensure_ascii=True) + "\n")
         sys.stderr.flush()

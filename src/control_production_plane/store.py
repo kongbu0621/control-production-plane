@@ -1,6 +1,7 @@
 """Transactional control records and a process lease, separate from external I/O."""
 from contextlib import contextmanager
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -222,6 +223,8 @@ class ControlStore:
             queued = db.execute("""SELECT body FROM events WHERE run_id=? AND operation='queue'
                 AND json_extract(body,'$.action_id')=? LIMIT 2""", (run_id, action_id)).fetchall()
             original = {key: action[key] for key in ("run_id", "attempt_id", "action_id", "kind")}
+            if "retry_failed" in action:
+                original["retry_failed"] = action["retry_failed"]
             m.require(len(queued) == 1 and json.loads(queued[0][0]) == original,
                       "Preparation history differs from original queued identity", "STORE_INVALID")
             if action["attempt_id"] != state["attempt"]["attempt_id"] or action["kind"] != "prepare":
@@ -380,7 +383,8 @@ class ControlStore:
                     "queue": self._queue, "dispatch": self._dispatch, "respond": self._respond,
                     "close_call": self._close_call, "observe": self._observe, "abandon": self._abandon,
                     "learning_candidate": self._learning, "preflight_failure": self._preflight_failure,
-                    "not_started": self._not_started}
+                    "not_started": self._not_started, "candidate": self._candidate,
+                    "decide": self._decide}
         m.require(type(operation) is str and operation in handlers, "Unknown operation")
         fingerprint = m.digest(request)
         committing = False
@@ -445,9 +449,10 @@ class ControlStore:
         m.require(body["expected_revision"] == state["revision"], "Plan revision changed", "CONFLICT")
         observation = state["attempt"]["observation"]
         revisable = not state["attempt"]["submission_recorded"] or (
-            observation and observation["exited"] and observation["outcome"] == "FAILED")
+            observation and observation["exited"] and (observation["outcome"] == "FAILED" or (observation["outcome"] == "SUCCEEDED"
+            and state["attempt"].get("decision", {}).get("decision") == "REJECT")))
         m.require(not state["cancel"] and revisable,
-                  "Revise only before submission or after confirmed exited failure", "NOT_READY")
+                  "Revise only before submission or after exited failure or rejected candidate", "NOT_READY")
         m.require(not self._pending(db, body["run_id"]), "Old calls remain unclosed", "PENDING")
         m.require(state["revision"] < 100, "Plan revision limit reached", "LIMIT")
         m.require(state["counters"]["attempts"] < state["budget"]["max_attempts"], "Business attempt budget exhausted", "LIMIT")
@@ -459,7 +464,11 @@ class ControlStore:
         return {"run_id": body["run_id"], "revision": state["revision"], "attempt_id": state["attempt"]["attempt_id"]}
 
     def _queue(self, db, body, lease):
-        m.fields(body, "run_id attempt_id action_id kind")
+        fields = "run_id attempt_id action_id kind"
+        m.fields(body, fields + (" retry_failed" if isinstance(body, dict) and "retry_failed" in body else ""))
+        if "retry_failed" in body:
+            m.require(body["kind"] == "prepare" and body["retry_failed"] is True,
+                      "retry_failed is only valid for preparation")
         m.uuid4(body["action_id"])
         m.require(type(body["kind"]) is str and body["kind"] in m.KINDS, "Unknown action kind")
         state = self._load(db, body["run_id"])
@@ -475,6 +484,8 @@ class ControlStore:
         if kind == "prepare":
             payload = {"operation_id": attempt["operation_id"], "kind": "workspace.edit",
                        "profile_ref": state["binding"]["profile_ref"], "inputs": m.inputs(state["plan"])}
+            if "retry_failed" in body:
+                payload["retry_failed"] = body["retry_failed"]
         elif kind == "submit":
             payload = self._current_prepared(db, state)
         elif kind == "cancel":
@@ -657,6 +668,72 @@ class ControlStore:
         attempt["observation"] = body
         self._save(db, state)
         return {"run_id": body["run_id"], "attempt_id": body["attempt_id"]}
+
+    def _candidate(self, db, body, lease):
+        m.fields(body, "run_id attempt_id artifact_id version_id source readback_ref receipt_sha256")
+        state = self._load(db, body["run_id"])
+        attempt, plan = state["attempt"], state["plan"]
+        m.require(body["attempt_id"] == attempt["attempt_id"], "Candidate belongs to another attempt", "CONFLICT")
+        for key in ("artifact_id", "version_id", "readback_ref"):
+            m.identity(body[key])
+        m.sha(body["receipt_sha256"])
+        observed = attempt["observation"]
+        m.require(observed and observed["exited"] and observed["outcome"] == "SUCCEEDED"
+                  and observed["evidence_state"] == "SEALED", "Candidate requires successful sealed execution", "NOT_READY")
+        source = body["source"]
+        m.require(type(source) is dict and source.get("schema_version") == "lh-artifact-source-v1"
+                  and source.get("producer") == state["binding"]["producer"]
+                  and source.get("operation_id") == attempt["operation_id"]
+                  and source.get("request_digest") == attempt["prepared_request"]["request_digest"],
+                  "Candidate source differs from the run", "IDENTITY_CONFLICT")
+        workspace = source.get("workspace")
+        for key in ("seal_sha256", "status_sha256"):
+            m.sha(source.get(key))
+        m.identity(source.get("seal_id"))
+        m.require(type(workspace) is dict and all(workspace.get(k) == v for k, v in dict(
+            schema_version="lh-workspace-edit-v1",
+            source_ref=plan["source_ref"], source_commit=plan["source_commit"], relative_path=plan["relative_path"],
+            validation_ref=plan["validation_ref"], before_sha256=plan["expected_sha256"],
+            after_sha256=hashlib.sha256(plan["content"].encode()).hexdigest()).items()),
+            "Candidate workspace differs from the plan", "IDENTITY_CONFLICT")
+        m.require(workspace.get("scope") == "TASK_OWNED_COPY" and workspace.get("original_modified") is False
+                  and all(workspace.get(key) is True for key in ("read_back_verified", "validation_succeeded",
+                                                               "edited_file_unchanged_by_validation")),
+                  "Candidate validation is not confirmed", "NOT_READY")
+        candidate = dict(body, goal_digest=state["goal_digest"], revision=state["revision"])
+        old = attempt.get("candidate")
+        m.require(old is None or {k:v for k,v in old.items() if k != "readback_ref"}
+                  == {k:v for k,v in candidate.items() if k != "readback_ref"},
+                  "A different candidate is already recorded", "CONFLICT")
+        # Another verified read of identical bytes keeps the original candidate
+        # identity; its new use reference is retained in this command's event.
+        candidate = old or candidate
+        attempt["candidate"] = candidate
+        self._save(db, state)
+        return {"run_id": state["run_id"], "candidate_digest": m.digest(candidate)}
+
+    def _decide(self, db, body, lease):
+        m.fields(body, "run_id attempt_id candidate_digest actor decision checks reason")
+        state = self._load(db, body["run_id"])
+        attempt = state["attempt"]
+        candidate = attempt.get("candidate")
+        m.require(body["attempt_id"] == attempt["attempt_id"] and candidate is not None,
+                  "No matching candidate", "CONFLICT")
+        m.require(body["candidate_digest"] == m.digest(candidate), "Candidate changed", "CONFLICT")
+        m.identity(body["actor"])
+        m.text(body["reason"], 4096)
+        m.require(body["decision"] in ("ACCEPT", "REJECT"), "Invalid decision")
+        checks = body["checks"]
+        m.require(type(checks) is list and len(checks) == len(state["goal"]["acceptance"]), "Acceptance checks are incomplete")
+        for condition, check in zip(state["goal"]["acceptance"], checks):
+            m.fields(check, "condition passed evidence_ref")
+            m.require(check["condition"] == condition and type(check["passed"]) is bool, "Acceptance condition differs")
+            m.identity(check["evidence_ref"])
+        m.require(body["decision"] != "ACCEPT" or all(c["passed"] for c in checks), "Unmet acceptance condition", "NOT_READY")
+        m.require(attempt.get("decision") is None or attempt["decision"] == body, "Decision already retained", "CONFLICT")
+        attempt["decision"] = body
+        self._save(db, state)
+        return {"run_id": state["run_id"], "decision": body["decision"], "candidate_digest": body["candidate_digest"]}
 
     def _learning(self, db, body, lease):
         m.fields(body, "run_id attempt_id candidate_id explanation evidence_refs artifact_versions")

@@ -4,7 +4,7 @@
 
 它要解决的问题是：**一项任务交给执行器之后，如何持续推进，知道做到了哪一步，处理失败，并拿到能按原目标验收的成果。**
 
-**当前版本：`0.1.0a1` alpha · Linux / Python 3.12 · [MIT 许可](LICENSE)。** 已有可安装的运行记录核心、Python 库和本地 CLI，支持目标与计划、动作意图、取消、失败修订和接续检查。Local Hand 执行适配、Ledger 归档消费及真实任务验收仍待接通；下文的完整生产流程是首版目标。当前已实现入口见[开始使用](#开始使用)。
+**当前版本：`0.1.0a2` alpha · Linux / Python 3.12 · [MIT 许可](LICENSE)。** 已有运行记录核心、Local Hand 公共 CLI 适配、证据下载、Ledger 归档与指定版本读回，以及明确的验收决定。适配链路已通过合成任务的真实 CLI/存储验证；现场生产任务尚未完成验收。当前已实现入口见[开始使用](#开始使用)。
 
 ## 它负责什么
 
@@ -22,13 +22,13 @@
 
 <a id="与-local-handledger-的关系"></a>
 
-下表说明计划中的协作关系。Local Hand 和 Ledger 已有实现；P 当前提供运行记录核心，K 仍处于设计阶段，尚未完成这些生产与知识接入。
+下表说明组件职责。P 已提供 Local Hand 和 Ledger 的静态适配器；实际可执行范围取决于部署开放的项目与验证。K 仍处于设计阶段。
 
 | 组件 | 主要职责与本仓关系 |
 | --- | --- |
 | **control-production-plane（P）** | 协调目标、计划、执行、验证、修复与接续，关联成果及验收决定 |
-| [infra-local-hand](https://github.com/kongbu0621/infra-local-hand) | 计划中的执行后端：P 通过其公共入口准备、提交、查询和取消任务；Local Hand 执行获准任务并返回原状态与封存证据 |
-| [infra-artifact-ledger](https://github.com/kongbu0621/infra-artifact-ledger) | 计划中的成果存储：P 经现有 `local-hand-archive` 保存成功封存的候选成果，按准确版本读回供审查；Ledger 保存内容与来源 |
+| [infra-local-hand](https://github.com/kongbu0621/infra-local-hand) | 执行后端：P 通过其公共入口准备、提交、查询和取消任务；Local Hand 执行获准任务并返回原状态与封存证据 |
+| [infra-artifact-ledger](https://github.com/kongbu0621/infra-artifact-ledger) | 成果存储：P 经现有 `local-hand-archive` 保存成功封存的候选成果，按准确版本读回供审查；Ledger 保存内容与来源 |
 | [domain-operational-knowledge-core（K）](https://github.com/kongbu0621/domain-operational-knowledge-core) | 可选知识组件（设计中）：拟向 P 提供已准入的准确知识版本，接收有来源的学习候选与使用反馈；知识审查和状态管理留在 K |
 
 知识接入是可选能力。任务未把知识列为必需输入时，可以独立推进，并记录未配置或降级的原因；任务若明确要求必需知识，未配置、无匹配或查询失败时，应阻止依赖它的新执行。不能伪造知识查询或回流成功。
@@ -61,7 +61,7 @@
 python3.12 -m venv .venv
 .venv/bin/python -m pip install setuptools==84.0.0 wheel==0.48.0
 .venv/bin/python -m pip wheel --no-build-isolation --no-deps . -w dist
-.venv/bin/python -m pip install --no-deps dist/control_production_plane-0.1.0a1-py3-none-any.whl
+.venv/bin/python -m pip install --no-deps dist/control_production_plane-0.1.0a2-py3-none-any.whl
 ```
 
 首次体验可运行[本地记录示例](examples/local_records.py)，使用一个不存在的私有目录：
@@ -81,12 +81,20 @@ python3.12 -m venv .venv
 | `production-plane show --run-id ID` | 查看当前目标、计划、尝试、取消意图和预算 |
 | `production-plane recover --run-id ID` | 读取原任务身份、未决调用和接续建议 |
 | `production-plane events --run-id ID` | 分页读取保留的原始命令历史 |
+| `production-plane inspect-executor` | 核对配置的 Local Hand 能力与身份 |
+| `production-plane execute-action --action-id ID` | 执行已排队的准备、提交、查询或取消动作 |
+| `production-plane reconcile-action --action-id ID` | 从保留的完整 CLI 回应补记原动作，不重发 |
+| `production-plane collect-evidence --action-id ID` | 按原状态中的可信封存标识完整下载证据 |
+| `production-plane archive-result --run-id ID` | 将成功封存的结果交给公共归档入口保存 |
+| `production-plane resume-archive --run-id ID` | 核对旧 CLI 停止后，恢复原任务的归档 |
+| `production-plane read-artifact --run-id ID` | 按准确成果/版本读回，校验实际内容并记录候选 |
+| `write` 的 `candidate` / `decide` 操作 | 保存已核对的候选与逐项验收决定 |
 | Python `initialize` / `open_store` | 显式创建或打开控制存储 |
 | Python `ControlStore.perform` | 为受信适配器保留调用意图、互斥和响应；需调用方提供适配器 |
 
 命令均需 `--store DIRECTORY`。已有目录、缺失或损坏的数据库不会被自动初始化覆盖。精确字段、调用闭合责任及错误处理见[公共接口](docs/INTERFACE.md)。
 
-当前记录核心不包含网络服务、真实执行器适配或成果验收入口。测试中的适配器响应是合成输入；实际部署身份、子进程退出、输出流完成和来源真实性仍须由后续适配器核验。
+执行和归档适配器需要在独立环境安装所选 Local Hand/Ledger 包，并使用显式的私有配置；配置与操作顺序见[执行、归档与验收](docs/ADAPTERS.md)。本组件按保存的任务方案逐步调用，不自动生成修复方案，也不自动应用补丁或提交 Git。
 
 ## 文档
 
