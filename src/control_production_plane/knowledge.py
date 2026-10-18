@@ -73,9 +73,10 @@ def feedback_material(store_id, state, usage, notes):
                  observation=observed, candidate=attempt.get("candidate"), decision=attempt.get("decision"),
                  cancel=state["cancel"], maintenance_stop=attempt.get("maintenance_stop"), notes=notes)
     raw = encoded(facts)
-    if len(raw) > 65536:
-        # Preserve exact references to the immutable P candidate/decision; do
-        # not send a valid P record larger than K's public material text bound.
+    if len(raw) > 65536 or len(m.canonical(facts)) > 65536:
+        # K limits UTF-8 text; P also stores ASCII-escaped JSON alongside
+        # the original facts. Bound both encodings before duplicating large
+        # candidate/decision bodies in the durable feedback intent.
         facts["snapshot_format"] = "bounded-references-v1"
         facts["full_snapshot_sha256"] = hashlib.sha256(raw).hexdigest()
         if facts["candidate"] is not None:
@@ -189,7 +190,8 @@ class KnowledgeAdapter:
         return k
 
     def query(self, kind, context, *, after="", limit=10):
-        return self._open().query(kind, context_value(context), after=after, limit=limit)
+        context = context_value(context)
+        return self._open().query(kind, context, after=after, limit=limit)
 
     def selection(self, version_id, context):
         context = context_value(context)
