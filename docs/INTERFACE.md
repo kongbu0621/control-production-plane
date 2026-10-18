@@ -87,6 +87,7 @@ store = initialize("/absolute/private/new-control-store")
 | `abandon` | `action_id`、`reason`；只放弃尚未下发的 `QUEUED` 动作，不消耗业务额度 |
 | `preflight_failure` | `action_id`、`code`；保存下发前的本地校验失败，保留同一待发动作和额度 |
 | `not_started` | `action_id`、`evidence_ref`；仅限已证明调用未启动且无远端影响的失败，退还该次额度；超时/丢响应不得使用 |
+| `confirm_not_accepted` | `action_id`、`operation_id`、`request_digest`、`evidence_ref`；提交已返回错误后，凭独立未接纳证明释放业务预留，保留原调用与失败；详见恢复语义 |
 | `candidate` | `run_id`、`attempt_id`、`artifact_id`、`version_id`、`source`、`readback_ref`、`receipt_sha256`；记录经实际读回核对的成果 |
 | `decide` | `run_id`、`attempt_id`、`candidate_digest`、`actor`、`decision`、`checks`、`reason`；明确接受或拒绝当前候选 |
 | `learning_candidate` | `run_id`、`attempt_id`、`candidate_id`、`explanation`、`evidence_refs`、`artifact_versions` |
@@ -108,6 +109,10 @@ store = initialize("/absolute/private/new-control-store")
 `decision` 为 `ACCEPT` 或 `REJECT`。`checks` 按原 goal.acceptance 顺序逐项包含 `{condition, passed, evidence_ref}`；不能遗漏或换掉条件，ACCEPT 要求全部通过。actor 和 reason 必填，决定绑定准确候选摘要与当前尝试。成功执行、归档或读回不会自动写 ACCEPT；同内容决定可幂等重放，旧决定不能套到新修订。
 
 ## 调用与恢复语义
+
+`confirm_not_accepted` 的 body 恰含 `action_id`、`operation_id`、`request_digest`、`evidence_ref`。它用于真实提交调用已退出、双流完整且返回错误之后，由受信操作者另行核实原执行端确实未接纳任务的接续。证明必须绑定原部署、主体、任务及请求；错误码、超时或一次 NOT_FOUND 都不能单独成为证明，核心不会自动生成这种结论。当前仅接受已闭合提交的 `{remote_error}` 错误响应，或适配器附有 `call_id` 与 `response_sha256` 的同类响应。
+
+该操作保留原 RESPONDED 动作、错误响应和已消耗调用额度，另附 `non_acceptance` 证明；只释放未被实际接纳的业务尝试预留。原尝试和 operation ID 不变，后续显式排队一个新提交动作，重新核对准备、授权、预算与取消状态。其他调用未闭合、请求错位、曾观察到运行/终态或证据封存时拒绝；证明与额度释放在同一事务中保存。同一证明重放不重复释放，也不清除后来提交；不同证明不能覆盖原证明。这不同于证明进程/传输从未启动的 `not_started`。
 
 动作从 `QUEUED` 经事务变为 `MAY_HAVE_RUN`，才允许适配器调用。响应保存后为 `RESPONDED`；`call_closed=false` 仍表示调用或采集未闭合。未下发或有明确未启动证明的动作为 `NOT_SENT`。进程在下发边界两侧被杀时，本地记录只证明已知事实，不能从缺响应推断无远端影响。
 

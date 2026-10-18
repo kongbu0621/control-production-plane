@@ -72,6 +72,7 @@
 | 完整 CLI 响应已保存、P 响应落账失败 | `reconcile-action` 从原始 bytes 和端点核验记录补记原动作；不再调用 CLI |
 | 控制进程被杀，原 CLI 或双流情况不明 | 保留原动作与缺口；沿原任务排队 query，必要时 cancel，不重提业务 |
 | submit 返回 IO_UNCERTAIN 或查询 NOT_FOUND | 核对原任务；不能据此退还业务额度或生成新任务 |
+| 原提交已完整返回错误，另有独立的原任务未接纳证明 | 用公共 `confirm_not_accepted` 保存绑定证明，保留原错误及调用额度；释放业务预留后，沿同一 operation ID 显式排队新提交。仅有错误或 NOT_FOUND 不满足条件，详见[接口](INTERFACE.md#调用与恢复语义) |
 | 首次归档的证据描述或原状态预检失败 | 修正输入后再调用 archive-result；未固定错误描述，未启动归档 CLI |
 | archive 完整返回 ERROR，且 CLI 已退出、双流 EOF 齐全 | 修正原因后可显式重调同输入的 `archive-result`；公共归档接口核对原 producer/operation 并复用已有写入，保留旧错误，不重跑业务 |
 | archive 超时、输出超限、丢响应或收集不完整 | 先确认旧 CLI 已停止，再 `resume-archive` 恢复原 producer/operation；不能把未知结果当成未执行 |

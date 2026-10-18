@@ -384,7 +384,7 @@ class ControlStore:
                     "close_call": self._close_call, "observe": self._observe, "abandon": self._abandon,
                     "learning_candidate": self._learning, "preflight_failure": self._preflight_failure,
                     "not_started": self._not_started, "candidate": self._candidate,
-                    "decide": self._decide}
+                    "decide": self._decide, "confirm_not_accepted": self._confirm_not_accepted}
         m.require(type(operation) is str and operation in handlers, "Unknown operation")
         fingerprint = m.digest(request)
         committing = False
@@ -609,6 +609,58 @@ class ControlStore:
         m.require(action["state"] == "QUEUED", "Preflight failure must precede dispatch", "CONFLICT")
         return {"run_id": action["run_id"], "action_id": action["action_id"], "state": "NOT_DISPATCHED"}
 
+    @staticmethod
+    def _require_no_execution_observed(db, state):
+        positive = db.execute("""SELECT 1 FROM events WHERE run_id=? AND operation='observe'
+            AND json_extract(body,'$.attempt_id')=? AND
+            (json_extract(body,'$.remote_state')!='NOT_FOUND'
+             OR json_extract(body,'$.outcome')!='UNKNOWN'
+             OR json_extract(body,'$.exited')!=0
+             OR json_extract(body,'$.evidence_state')='SEALED') LIMIT 1""",
+            (state['run_id'], state['attempt']['attempt_id'])).fetchone()
+        observation = state['attempt']['observation']
+        compatible = observation is None or (
+            observation['remote_state'] == 'NOT_FOUND' and observation['outcome'] == 'UNKNOWN'
+            and observation['exited'] is False and observation['evidence_state'] != 'SEALED')
+        m.require(compatible and positive is None, 'Remote observation conflicts with non-acceptance proof', 'CONFLICT')
+
+    def _confirm_not_accepted(self, db, body, lease):
+        """Retain a real error response and separately record a trusted proof.
+
+        An error or NOT_FOUND alone is never a proof. The caller must verify the
+        original deployment, request, closed transport and no admitted task.
+        """
+        m.fields(body, 'action_id operation_id request_digest evidence_ref')
+        m.uuid4(body['operation_id']); m.sha(body['request_digest']); m.identity(body['evidence_ref'])
+        action = self._action(db, body['action_id'])
+        old = action.get('non_acceptance')
+        if old is not None:
+            m.require(old == body, 'Original non-acceptance proof differs', 'CONFLICT')
+            return dict(run_id=action['run_id'], action_id=body['action_id'], non_acceptance_recorded=True)
+        state = self._load(db, action['run_id'])
+        attempt = state['attempt']
+        m.require(action['kind'] == 'submit' and action['state'] == 'RESPONDED'
+                  and action['call_closed'] is True and type(action['response']) is dict
+                  and set(action['response']) in ({'remote_error'}, {'remote_error', 'call_id', 'response_sha256'})
+                  and type(action['response'].get('remote_error')) is str,
+                  'Non-acceptance requires a closed submission error', 'CONFLICT')
+        m.identity(action['response']['remote_error'])
+        if 'call_id' in action['response']:
+            m.identity(action['response']['call_id']); m.sha(action['response']['response_sha256'])
+        m.require(action['attempt_id'] == attempt['attempt_id'] and attempt['submission_recorded']
+                  and body['operation_id'] == attempt['operation_id'] == action['payload']['operation_id']
+                  and body['request_digest'] == action['payload']['request_digest']
+                  == attempt['prepared_request']['request_digest'], 'Submission proof binding differs', 'CONFLICT')
+        m.require(not self._pending(db, state['run_id']), 'Calls remain unclosed', 'PENDING')
+        self._require_no_execution_observed(db, state)
+        m.require(state['counters']['attempts'] > 0, 'Missing business reservation', 'STORE_INVALID')
+        action['non_acceptance'] = body
+        attempt['submission_recorded'] = False
+        state['counters']['attempts'] -= 1
+        self._save_action(db, action)
+        self._save(db, state)
+        return dict(run_id=state['run_id'], action_id=body['action_id'], non_acceptance_recorded=True)
+
     def _not_started(self, db, body, lease):
         m.fields(body, "action_id evidence_ref")
         m.identity(body["evidence_ref"])
@@ -623,18 +675,7 @@ class ControlStore:
             # A concurrent NOT_FOUND is not proof of execution or non-execution.
             # Accept an independent no-start proof only if it conflicts with no
             # observation of this attempt, including facts later hidden by NOT_FOUND.
-            positive = db.execute("""SELECT 1 FROM events WHERE run_id=? AND operation='observe'
-                AND json_extract(body,'$.attempt_id')=? AND
-                (json_extract(body,'$.remote_state')!='NOT_FOUND'
-                 OR json_extract(body,'$.outcome')!='UNKNOWN'
-                 OR json_extract(body,'$.exited')!=0
-                 OR json_extract(body,'$.evidence_state')='SEALED') LIMIT 1""",
-                (state["run_id"], action["attempt_id"])).fetchone()
-            observation = state["attempt"]["observation"]
-            compatible = observation is None or (
-                observation["remote_state"] == "NOT_FOUND" and observation["outcome"] == "UNKNOWN"
-                and observation["exited"] is False and observation["evidence_state"] != "SEALED")
-            m.require(compatible and positive is None, "Remote observation conflicts with non-start proof", "CONFLICT")
+            self._require_no_execution_observed(db, state)
             state["attempt"]["submission_recorded"] = False
             state["counters"]["attempts"] -= 1
         counter = {"query": "queries", "cancel": "cancellations"}.get(action["kind"], "actions")
