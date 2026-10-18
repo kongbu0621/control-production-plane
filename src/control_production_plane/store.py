@@ -255,21 +255,28 @@ class ControlStore:
                                 "operation": "dispatch", "body": {"action_id": action_id, "observed_binding": observed_binding}}, lease=lease)
         m.require(not receipt["replayed"], "Dispatch receipt is historical, not permission to invoke", "PENDING")
         try:
-            result = invoke(json.loads(m.canonical(action["payload"])))
-        except m.CallNotStarted as exc:
-            self.execute({"schema": "production-plane-v1", "request_id": "not-started:" + action_id,
-                          "operation": "not_started", "body": {"action_id": action_id, "evidence_ref": exc.evidence_ref}})
+            try:
+                result = invoke(json.loads(m.canonical(action["payload"])))
+            except m.CallNotStarted as exc:
+                self.execute({"schema": "production-plane-v1", "request_id": "not-started:" + action_id,
+                              "operation": "not_started", "body": {"action_id": action_id, "evidence_ref": exc.evidence_ref}})
+                raise
+            except Exception as exc:
+                self.execute({"schema": "production-plane-v1", "request_id": "response:" + action_id,
+                              "operation": "respond", "body": {"action_id": action_id,
+                              "response": {"transport_error": type(exc).__name__}, "call_closed": False}})
+                raise ControlError("CALL_UNKNOWN", "Adapter failed; query original task and retain call gap",
+                                   commit_state="committed") from exc
+            m.validate_tree(result)
+            m.fields(result, "response call_closed")
+            return self.execute({"schema": "production-plane-v1", "request_id": "response:" + action_id,
+                                 "operation": "respond", "body": dict(result, action_id=action_id)})
+        except ControlError as exc:
+            # This step may fail before/after its own commit, but dispatch has
+            # already committed. Preserve that distinction on the public error.
+            exc.action_id = action_id
+            exc.dispatch_recorded = True
             raise
-        except Exception as exc:
-            self.execute({"schema": "production-plane-v1", "request_id": "response:" + action_id,
-                          "operation": "respond", "body": {"action_id": action_id,
-                          "response": {"transport_error": type(exc).__name__}, "call_closed": False}})
-            raise ControlError("CALL_UNKNOWN", "Adapter failed; query original task and retain call gap",
-                               commit_state="committed") from exc
-        m.validate_tree(result)
-        m.fields(result, "response call_closed")
-        return self.execute({"schema": "production-plane-v1", "request_id": "response:" + action_id,
-                             "operation": "respond", "body": dict(result, action_id=action_id)})
 
     def events(self, run_id, *, after=0, limit=10):
         m.natural(after, low=0, high=9007199254740991)
@@ -416,7 +423,7 @@ class ControlStore:
             payload = attempt["prepared_request"]
         elif kind == "cancel":
             m.require(state["cancel"] and attempt["submission_recorded"], "Cancellation requires a submitted attempt and local intent", "NOT_READY")
-            payload = {"operation_id": attempt["operation_id"], "request_digest": attempt["prepared_request"]["request_digest"], "target": {"kind": "job"}}
+            payload = {"operation_id": attempt["operation_id"], "expected_request_digest": attempt["prepared_request"]["request_digest"], "target": {"kind": "job"}}
         else:
             payload = {"operation_id": attempt["operation_id"]}
         action = dict(body, payload=payload, state="QUEUED", call_closed=False, response=None)
@@ -446,6 +453,18 @@ class ControlStore:
                           "Another run has an unresolved execution", "PENDING")
                 m.require(not [a for a in self._pending(db, other_id) if a["kind"] != "query"],
                           "Another run has an unresolved call", "PENDING")
+        if kind == "prepare":
+            # A new preparation must establish readiness again. Prior READY
+            # requests remain in their action records, never as current grants.
+            state["attempt"]["prepared_request"] = None
+        if kind == "cancel":
+            attempt = state["attempt"]
+            m.require(state["cancel"] and attempt["submission_recorded"],
+                      "No original submission remains to cancel", "NOT_READY")
+            expected = {"operation_id": attempt["operation_id"],
+                        "expected_request_digest": attempt["prepared_request"]["request_digest"],
+                        "target": {"kind": "job"}}
+            m.require(action["payload"] == expected, "Cancellation no longer matches original submission", "CONFLICT")
         if kind == "submit":
             m.require(action["payload"] == state["attempt"]["prepared_request"], "Prepared revision changed", "CONFLICT")
             m.require(time.time() < action["payload"]["expires_at"], "Prepared request expired", "NOT_READY")

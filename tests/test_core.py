@@ -154,6 +154,159 @@ class CoreTests(unittest.TestCase):
         self.assertIsNone(self.store.get_run("example")["attempt"]["prepared_request"])
         self.assertEqual(self.store.get_action(action)["state"], "MAY_HAVE_RUN")
 
+    def test_invalid_response_after_external_effect_reports_recorded_dispatch(self):
+        self.prepare()
+        action = self.queue("submit")
+        effects = []
+        def malformed(payload):
+            effects.append(payload["operation_id"])
+            return {"response": [], "call_closed": True}
+        error = self.error("INVALID_INPUT", self.store.perform, action, self.spec["binding"], malformed)
+        self.assertEqual(error.commit_state, "not_committed")
+        self.assertTrue(error.as_dict()["dispatch_recorded"])
+        self.assertEqual(error.as_dict()["action_id"], action)
+        self.assertEqual(self.store.get_action(action)["state"], "MAY_HAVE_RUN")
+        self.assertEqual(self.store.get_run("example")["counters"]["attempts"], 1)
+        self.error("PENDING", self.store.perform, action, self.spec["binding"], malformed)
+        self.assertEqual(len(effects), 1)
+
+    def test_response_recording_failure_keeps_dispatch_and_single_effect(self):
+        self.prepare()
+        action = self.queue("submit")
+        effects = []
+        original = sqlite3.connect
+        class Connection(sqlite3.Connection):
+            def commit(self):
+                raise sqlite3.OperationalError("synthetic response commit failure")
+        def invoke(payload):
+            effects.append(payload["operation_id"])
+            fault = patch("control_production_plane.store.sqlite3.connect",
+                          side_effect=lambda *a, **k: original(*a, **k, factory=Connection))
+            fault.start()
+            self.addCleanup(fault.stop)
+            return {"response": {"accepted": True}, "call_closed": True}
+        error = self.error("STORAGE_ERROR", self.store.perform, action, self.spec["binding"], invoke)
+        self.assertEqual(error.commit_state, "unknown")
+        self.assertTrue(error.as_dict()["dispatch_recorded"])
+        self.assertEqual(error.as_dict()["action_id"], action)
+        self.assertEqual(self.store.get_action(action)["state"], "MAY_HAVE_RUN")
+        self.error("PENDING", self.store.perform, action, self.spec["binding"], invoke)
+        self.assertEqual(len(effects), 1)
+
+    def test_refresh_that_is_not_ready_invalidates_prior_request(self):
+        for reply in ("PREPARING", "FAILED"):
+            with self.subTest(reply=reply):
+                self.store = initialize(self.root / reply)
+                self.store.execute(command("create", self.spec))
+                first = self.prepare()
+                original = self.store.get_run("example")["attempt"]
+                queued = self.queue("submit")
+                refresh = self.queue("prepare")
+                self.store.perform(refresh, self.spec["binding"],
+                                   lambda p: {"response": {"state": reply}, "call_closed": True})
+                self.assertIsNone(self.store.get_run("example")["attempt"]["prepared_request"])
+                self.assertEqual(self.store.get_action(first)["response"]["request"], original["prepared_request"])
+                called = []
+                self.error("CONFLICT", self.store.perform, queued, self.spec["binding"], called.append)
+                self.error("NOT_READY", self.queue, "submit")
+                self.assertEqual(called, [])
+                self.assertEqual(self.store.get_run("example")["counters"]["attempts"], 0)
+                self.prepare()
+                fresh = self.queue("submit")
+                self.store.perform(fresh, self.spec["binding"],
+                                   lambda p: {"response": {"accepted": True}, "call_closed": True})
+                self.assertEqual(self.store.get_run("example")["attempt"]["operation_id"], original["operation_id"])
+
+    def test_ready_refresh_preflight_failure_retains_original_request(self):
+        self.prepare()
+        original = self.store.get_run("example")["attempt"]["prepared_request"]
+        refresh = self.queue("prepare")
+        def reject(payload):
+            raise ControlError("LOCAL_CHECK", "Synthetic local preflight failure")
+        self.error("LOCAL_CHECK", self.store.perform, refresh, self.spec["binding"], ready, preflight=reject)
+        self.assertEqual(self.store.get_run("example")["attempt"]["prepared_request"], original)
+
+    def test_ready_refresh_budget_rejection_rolls_back_invalidation(self):
+        spec = sample("limited-refresh")
+        spec["budget"]["max_actions"] = 1
+        self.store.execute(command("create", spec))
+        first = self.queue("prepare", spec["run_id"])
+        self.store.perform(first, spec["binding"], ready)
+        original = self.store.get_run(spec["run_id"])
+        refresh = self.queue("prepare", spec["run_id"])
+        self.error("LIMIT", self.store.perform, refresh, spec["binding"], ready)
+        self.assertEqual(self.store.get_run(spec["run_id"]), original)
+        self.assertEqual(self.store.get_action(refresh)["state"], "QUEUED")
+
+    def test_refresh_process_exit_preserves_old_ready_only_as_history(self):
+        first = self.prepare()
+        queued = self.queue("submit")
+        refresh = self.queue("prepare")
+        original = self.store.get_run("example")["attempt"]
+        code = '''import os,sys
+from control_production_plane import open_store
+s=open_store(sys.argv[1])
+s.perform(sys.argv[2],s.get_run('example')['binding'],lambda payload:os._exit(72))
+'''
+        result = subprocess.run([sys.executable, "-c", code, str(self.path), refresh], capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 72, result.stderr)
+        self.store = open_store(self.path)
+        self.assertIsNone(self.store.get_run("example")["attempt"]["prepared_request"])
+        self.assertEqual(self.store.get_action(first)["response"]["request"], original["prepared_request"])
+        called = []
+        self.error("PENDING", self.store.perform, queued, self.spec["binding"], called.append)
+        self.assertEqual(called, [])
+        self.assertEqual(self.store.recover("example")["next_step"], "RECONCILE_ORIGINAL_PREPARATION")
+
+    def test_cancel_payload_matches_executor_public_contract(self):
+        self.submit()
+        self.store.execute(command("cancel", {"run_id": "example", "reason": "Stop"}))
+        action = self.queue("cancel")
+        attempt = self.store.get_run("example")["attempt"]
+        expected = {"operation_id": attempt["operation_id"],
+                    "expected_request_digest": attempt["prepared_request"]["request_digest"],
+                    "target": {"kind": "job"}}
+        seen = []
+        def cancel(payload):
+            seen.append(payload)
+            return {"response": {"requested": True}, "call_closed": True}
+        self.store.perform(action, self.spec["binding"], cancel)
+        self.assertEqual(seen, [expected])
+
+    def test_legacy_queued_cancel_is_retained_and_requires_new_action(self):
+        self.submit()
+        self.store.execute(command("cancel", {"run_id": "example", "reason": "Stop"}))
+        action = self.queue("cancel")
+        legacy = self.store.get_action(action)
+        legacy["payload"]["request_digest"] = legacy["payload"].pop("expected_request_digest")
+        # Fixture models the exact queued record written by the first version.
+        with sqlite3.connect(self.path / "runs.sqlite") as db:
+            db.execute("UPDATE actions SET document=? WHERE action_id=?", (canonical(legacy).decode(), action))
+        called = []
+        self.error("CONFLICT", self.store.perform, action, self.spec["binding"], called.append)
+        self.assertEqual(called, [])
+        self.assertEqual(self.store.get_action(action), legacy)
+        self.assertEqual(self.store.get_run("example")["counters"]["cancellations"], 0)
+        self.store.execute(command("abandon", {"action_id": action, "reason": "Replace unsent legacy cancellation"}))
+        new = self.queue("cancel")
+        self.assertEqual(self.store.get_action(new)["payload"]["operation_id"], legacy["payload"]["operation_id"])
+        self.store.perform(new, self.spec["binding"], lambda p: {"response": {"requested": True}, "call_closed": True})
+
+    def test_cancel_queued_during_submit_cannot_dispatch_after_no_start_proof(self):
+        self.prepare()
+        submit = self.queue("submit")
+        cancellations = []
+        def cannot_start(payload):
+            self.store.execute(command("cancel", {"run_id": "example", "reason": "Stop"}))
+            cancellations.append(self.queue("cancel"))
+            raise CallNotStarted("demo:spawn-did-not-start")
+        self.error("CALL_NOT_STARTED", self.store.perform, submit, self.spec["binding"], cannot_start)
+        called = []
+        self.error("NOT_READY", self.store.perform, cancellations[0], self.spec["binding"], called.append)
+        self.assertEqual(called, [])
+        self.assertEqual(self.store.get_run("example")["counters"]["cancellations"], 0)
+        self.assertTrue(self.store.get_run("example")["cancel"])
+
     def test_preflight_failure_keeps_original_action_retryable_and_quota(self):
         action = self.queue("prepare")
         called = []

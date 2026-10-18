@@ -107,6 +107,10 @@ store = initialize("/absolute/private/new-control-store")
 
 接收 `READY` 时校验操作 ID、任务类型、profile、inputs、有效期与请求摘要；保存完整请求，提交前原样取出。完整的 Local Hand schema、启动绑定和能力验证由后续真实适配器补齐；样例里的合成 READY 不是可下发的真实请求。
 
+新的准备动作一旦落下发意图，就清除当前可提交请求，等待该轮重新得到有效 `READY`；旧请求仍完整保存在原动作响应中。该轮返回 `PREPARING`、`FAILED`、调用中断或结果未知时，不能继续提交旧 READY。仅本地预检失败或下发事务回滚时，原请求保持不变。
+
+取消 payload 使用 `operation_id`、`expected_request_digest` 和 `target={"kind":"job"}`，与 Local Hand 公共接口一致。下发时再次核对原提交及摘要。首批实现中以 `request_digest` 排队的旧取消动作保留，但拒绝下发；确认仍为 `QUEUED` 后可用 `abandon` 保留为未发送，再为同一原任务排队新的取消动作。已经可能发送的动作继续核对原结果，不能按此方式替换或重做业务。
+
 一次 `perform` 只取得一个待发动作的调用权，不自动循环推进任务。恢复查询不隐式执行。另一个运行有未闭合调用或未退出业务时，不允许新的准备/提交；原任务查询和取消仍保留独立入口。
 
 ## 持久化、限额与错误
@@ -118,3 +122,5 @@ store = initialize("/absolute/private/new-control-store")
 目录只能位于受信本地文件系统；不支持 NAS 上活动数据库、多机写入、多租户鉴权、任意数据库回滚后的自动恢复、任意掉电保证或数据库格式迁移。完整控制目录须一起保留；本版没有备份/恢复命令。已识别的缺失、冲突和损坏应先核对原记录，不重新建立空库替代。
 
 库抛出 `ControlError(code, message, commit_state=...)`；主要代码为 `INVALID_INPUT`、`LIMIT`、`CONFLICT`、`NOT_FOUND`、`NOT_READY`、`PENDING`、`BUSY`、`LEASE_REQUIRED`、`IDENTITY_CONFLICT`、`STORE_INVALID`、`STORAGE_ERROR`、`CALL_UNKNOWN`、`CALL_NOT_STARTED`。CLI 成功输出单行 JSON 到 stdout、退出 0；失败输出结构化错误到 stderr、退出 2。输出失败不会撤销已提交记录，仍须按原请求核对。
+
+`perform` 在确认下发意图落账后，若适配器、响应校验或响应持久化抛出 `ControlError`，其属性和 `as_dict()` 额外包含原 `action_id` 与 `dispatch_recorded=true`。`commit_state` 保留报错步骤自身的状态：例如响应未提交或提交结果未知，都不表示此前的下发没有发生。使用原动作读取当前事实，不凭错误重放；`dispatch_recorded` 也不证明业务实际执行成功，未启动证明仍按 `CALL_NOT_STARTED` 和原记录核对。该字段缺失不构成未下发证明，特别是下发事务本身返回 unknown 或进程没有返回时。

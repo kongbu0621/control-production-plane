@@ -15,9 +15,14 @@ class ControlError(Exception):
     def __init__(self, code, message, *, commit_state="not_committed"):
         super().__init__(message)
         self.code, self.message, self.commit_state = code, message, commit_state
+        self.action_id = None
+        self.dispatch_recorded = None
 
     def as_dict(self):
-        return {"code": self.code, "message": self.message, "commit_state": self.commit_state}
+        result = {"code": self.code, "message": self.message, "commit_state": self.commit_state}
+        if self.action_id is not None:
+            result.update(action_id=self.action_id, dispatch_recorded=self.dispatch_recorded)
+        return result
 
 
 class CallNotStarted(ControlError):
