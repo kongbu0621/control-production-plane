@@ -1,0 +1,575 @@
+"""Transactional control records and a process lease, separate from external I/O."""
+from contextlib import contextmanager
+import fcntl
+import json
+import os
+from pathlib import Path
+import sqlite3
+import stat
+import time
+import uuid
+
+from . import model as m
+from .model import ControlError
+
+APP_ID = 0x43505031
+SCHEMA = "production-plane-store-v1"
+SQL = """
+CREATE TABLE metadata (store_id TEXT PRIMARY KEY, schema TEXT NOT NULL);
+CREATE TABLE runs (run_id TEXT PRIMARY KEY, document TEXT NOT NULL);
+CREATE TABLE revisions (run_id TEXT NOT NULL, revision INTEGER NOT NULL, document TEXT NOT NULL,
+ PRIMARY KEY(run_id,revision), FOREIGN KEY(run_id) REFERENCES runs(run_id));
+CREATE TABLE actions (action_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, document TEXT NOT NULL,
+ FOREIGN KEY(run_id) REFERENCES runs(run_id));
+CREATE TABLE receipts (request_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result TEXT NOT NULL);
+CREATE TABLE events (seq INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL,
+ operation TEXT NOT NULL, body TEXT NOT NULL, recorded_at INTEGER NOT NULL,
+ FOREIGN KEY(run_id) REFERENCES runs(run_id));
+CREATE TABLE candidates (candidate_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, document TEXT NOT NULL,
+ FOREIGN KEY(run_id) REFERENCES runs(run_id));
+CREATE INDEX action_run ON actions(run_id);
+CREATE INDEX event_run ON events(run_id, seq);
+"""
+
+
+def _private(path, directory=False):
+    info = path.lstat()
+    valid = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+    m.require(valid and info.st_uid == os.geteuid() and not info.st_mode & 0o077,
+              "Control files must be private and owned by the caller", "STORE_INVALID")
+    if not directory:
+        m.require(info.st_nlink == 1, "Control file has multiple links", "STORE_INVALID")
+    return info.st_dev, info.st_ino
+
+
+def _fsync(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def initialize(directory):
+    """Create a new private store. Existing and incomplete directories are retained."""
+    root = Path(directory).absolute()
+    try:
+        root.mkdir(mode=0o700)
+    except FileExistsError as exc:
+        raise ControlError("ALREADY_EXISTS", "Initialization requires an absent directory") from exc
+    store_id = str(uuid.uuid4())
+    try:
+        for name in ("runs.sqlite", "executor.lock"):
+            fd = os.open(root / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.close(fd)
+        with sqlite3.connect(root / "runs.sqlite") as db:
+            db.execute("PRAGMA synchronous=FULL")
+            db.execute(f"PRAGMA application_id={APP_ID}")
+            db.execute("PRAGMA user_version=1")
+            db.executescript(SQL)
+            db.execute("INSERT INTO metadata VALUES (?, ?)", (store_id, SCHEMA))
+        raw = m.canonical({"schema": SCHEMA, "store_id": store_id})
+        fd = os.open(root / "identity.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _fsync(root)
+        _fsync(root.parent)
+    except (OSError, sqlite3.Error) as exc:
+        raise ControlError("STORAGE_ERROR", "Initialization incomplete; retain directory and inspect",
+                           commit_state="unknown") from exc
+    return open_store(root)
+
+
+def open_store(directory):
+    return ControlStore(directory)
+
+
+class _Lease:
+    def __init__(self, store, fd):
+        self.store, self.fd, self.pid, self.active = store, fd, os.getpid(), True
+
+    def verify(self, store):
+        m.require(self.active and self.pid == os.getpid() and self.store is store,
+                  "An active executor lease from this handle is required", "LEASE_REQUIRED")
+        m.require((os.fstat(self.fd).st_dev, os.fstat(self.fd).st_ino) == store.identities["executor.lock"],
+                  "Executor lock identity changed", "STORE_INVALID")
+
+
+class ControlStore:
+    def __init__(self, directory):
+        self.root = Path(directory).absolute()
+        self.identities = {}
+        try:
+            self.identities["."] = _private(self.root, directory=True)
+            for name in ("runs.sqlite", "identity.json", "executor.lock"):
+                self.identities[name] = _private(self.root / name)
+            with (self.root / "identity.json").open("rb") as stream:
+                self.identity = m.decode(stream.read(m.MAX_JSON + 1))
+            m.fields(self.identity, "schema store_id")
+            m.require(self.identity["schema"] == SCHEMA, "Unsupported store schema", "STORE_INVALID")
+            m.uuid4(self.identity["store_id"])
+            with self._connection() as db:
+                m.require(db.execute("PRAGMA application_id").fetchone()[0] == APP_ID
+                          and db.execute("PRAGMA user_version").fetchone()[0] == 1,
+                          "Unsupported database format", "STORE_INVALID")
+                m.require(db.execute("SELECT store_id, schema FROM metadata").fetchall()
+                          == [(self.identity["store_id"], SCHEMA)], "Store identity mismatch", "STORE_INVALID")
+                m.require(db.execute("PRAGMA quick_check(1)").fetchone()[0] == "ok",
+                          "Database integrity check failed", "STORE_INVALID")
+        except (OSError, sqlite3.Error) as exc:
+            raise ControlError("STORE_INVALID", "Store missing, inaccessible or damaged; not initialized automatically") from exc
+
+    def _check_identity(self):
+        try:
+            for name, expected in self.identities.items():
+                m.require(_private(self.root / name, directory=name == ".") == expected,
+                          "Open store files were replaced", "STORE_INVALID")
+        except OSError as exc:
+            raise ControlError("STORE_INVALID", "Open store files are no longer accessible") from exc
+
+    @contextmanager
+    def _connection(self):
+        self._check_identity()
+        db = None
+        try:
+            db = sqlite3.connect((self.root / "runs.sqlite").as_uri() + "?mode=rw", uri=True,
+                                 timeout=1, isolation_level=None)
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute("PRAGMA synchronous=FULL")
+            yield db
+        finally:
+            if db is not None:
+                db.close()
+
+    @contextmanager
+    def executor(self):
+        """One executor per store. Does not hold a SQLite transaction across I/O."""
+        self._check_identity()
+        fd = os.open(self.root / "executor.lock", os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+        lease = _Lease(self, fd)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise ControlError("BUSY", "Another executor holds this store") from exc
+            lease.verify(self)
+            yield lease
+        finally:
+            lease.active = False
+            os.close(fd)
+
+    @staticmethod
+    def _load(db, run_id):
+        m.identity(run_id)
+        row = db.execute("SELECT document FROM runs WHERE run_id=?", (run_id,)).fetchone()
+        m.require(row is not None, "Run not found", "NOT_FOUND")
+        return m.decode(row[0].encode("ascii"))
+
+    @staticmethod
+    def _action(db, action_id):
+        m.uuid4(action_id)
+        row = db.execute("SELECT document FROM actions WHERE action_id=?", (action_id,)).fetchone()
+        m.require(row is not None, "Action not found", "NOT_FOUND")
+        return m.decode(row[0].encode("ascii"))
+
+    @staticmethod
+    def _save(db, state):
+        m.validate_tree(state)
+        db.execute("UPDATE runs SET document=? WHERE run_id=?", (m.canonical(state).decode(), state["run_id"]))
+
+    @staticmethod
+    def _save_action(db, action):
+        m.validate_tree(action)
+        db.execute("UPDATE actions SET document=? WHERE action_id=?", (m.canonical(action).decode(), action["action_id"]))
+
+    @staticmethod
+    def _pending(db, run_id):
+        result = []
+        for row in db.execute("SELECT document FROM actions WHERE run_id=?", (run_id,)):
+            action = m.decode(row[0].encode("ascii"))
+            if action["state"] == "MAY_HAVE_RUN" or (action["state"] == "RESPONDED" and not action["call_closed"]):
+                result.append(action)
+        return result
+
+    @contextmanager
+    def _reading(self):
+        try:
+            with self._connection() as db:
+                yield db
+        except sqlite3.Error as exc:
+            raise ControlError("STORE_INVALID", "Persistent record cannot be read",
+                               commit_state="not_applicable") from exc
+
+    def get_run(self, run_id):
+        with self._reading() as db:
+            return self._load(db, run_id)
+
+    def get_action(self, action_id):
+        with self._reading() as db:
+            return self._action(db, action_id)
+
+    def get_revision(self, run_id, revision):
+        m.natural(revision, high=100)
+        with self._reading() as db:
+            db.execute("BEGIN")
+            state = self._load(db, run_id)
+            if state["revision"] == revision:
+                return state
+            row = db.execute("SELECT document FROM revisions WHERE run_id=? AND revision=?", (run_id, revision)).fetchone()
+            m.require(row is not None, "Plan revision not found", "NOT_FOUND")
+            return m.decode(row[0].encode("ascii"))
+
+    def get_candidate(self, candidate_id):
+        m.identity(candidate_id)
+        with self._reading() as db:
+            row = db.execute("SELECT document FROM candidates WHERE candidate_id=?", (candidate_id,)).fetchone()
+            m.require(row is not None, "Candidate not found", "NOT_FOUND")
+            return m.decode(row[0].encode("ascii"))
+
+    def perform(self, action_id, observed_binding, invoke, *, preflight=None):
+        """Call a trusted adapter once, after durable dispatch; never auto-redeliver.
+
+        invoke(payload) returns {response: object, call_closed: bool}. The adapter
+        must prove closure of any child process and both streams before reporting
+        call_closed. It must enforce its own bounded I/O and full remote schema.
+        """
+        action = self.get_action(action_id)
+        if action["kind"] in ("query", "cancel"):
+            return self._perform(action_id, observed_binding, invoke, preflight, None)
+        with self.executor() as lease:
+            return self._perform(action_id, observed_binding, invoke, preflight, lease)
+
+    def _perform(self, action_id, observed_binding, invoke, preflight, lease):
+        action = self.get_action(action_id)
+        m.require(action["state"] == "QUEUED", "Original action already passed the dispatch boundary", "PENDING")
+        if preflight is not None:
+            try:
+                preflight(json.loads(m.canonical(action["payload"])))
+            except ControlError as exc:
+                self.execute({"schema": "production-plane-v1", "request_id": str(uuid.uuid4()),
+                              "operation": "preflight_failure", "body": {"action_id": action_id, "code": exc.code}})
+                raise
+        receipt = self.execute({"schema": "production-plane-v1", "request_id": "dispatch:" + action_id,
+                                "operation": "dispatch", "body": {"action_id": action_id, "observed_binding": observed_binding}}, lease=lease)
+        m.require(not receipt["replayed"], "Dispatch receipt is historical, not permission to invoke", "PENDING")
+        try:
+            result = invoke(json.loads(m.canonical(action["payload"])))
+        except m.CallNotStarted as exc:
+            self.execute({"schema": "production-plane-v1", "request_id": "not-started:" + action_id,
+                          "operation": "not_started", "body": {"action_id": action_id, "evidence_ref": exc.evidence_ref}})
+            raise
+        except Exception as exc:
+            self.execute({"schema": "production-plane-v1", "request_id": "response:" + action_id,
+                          "operation": "respond", "body": {"action_id": action_id,
+                          "response": {"transport_error": type(exc).__name__}, "call_closed": False}})
+            raise ControlError("CALL_UNKNOWN", "Adapter failed; query original task and retain call gap",
+                               commit_state="committed") from exc
+        m.validate_tree(result)
+        m.fields(result, "response call_closed")
+        return self.execute({"schema": "production-plane-v1", "request_id": "response:" + action_id,
+                             "operation": "respond", "body": dict(result, action_id=action_id)})
+
+    def events(self, run_id, *, after=0, limit=10):
+        m.natural(after, low=0, high=9007199254740991)
+        m.natural(limit, high=10)
+        with self._reading() as db:
+            self._load(db, run_id)
+            rows = db.execute("SELECT seq,operation,body,recorded_at FROM events WHERE run_id=? AND seq>? ORDER BY seq LIMIT ?",
+                              (run_id, after, limit)).fetchall()
+            return [{"sequence": r[0], "operation": r[1], "body": json.loads(r[2]), "recorded_at": r[3]} for r in rows]
+
+    def recover(self, run_id):
+        """Read-only recovery advice. Never invokes or replays an external operation."""
+        with self._reading() as db:
+            db.execute("BEGIN")
+            state = self._load(db, run_id)
+            pending = self._pending(db, run_id)
+            queued = [r[0] for r in db.execute("SELECT action_id FROM actions WHERE run_id=? AND json_extract(document,'$.state')='QUEUED'", (run_id,))]
+            attempt = state["attempt"]
+            if attempt["observation"] and attempt["observation"]["exited"]:
+                next_step = "REVIEW_OBSERVED_RESULT"
+            elif attempt["submission_recorded"]:
+                next_step = "QUERY_ORIGINAL_TASK"
+            elif state["cancel"]:
+                next_step = "NO_NEW_SUBMISSION"
+            elif pending:
+                next_step = "RECONCILE_ORIGINAL_PREPARATION"
+            else:
+                next_step = "CONTINUE_UNSENT_PLAN"
+            return {"run": state, "next_step": next_step,
+                    "pending_calls": [{"action_id": a["action_id"], "kind": a["kind"], "state": a["state"]} for a in pending],
+                    "queued_actions": queued, "external_calls_made": 0}
+
+    def execute(self, request, *, lease=None):
+        """Commit a bounded local command; receipts and domain changes are atomic."""
+        if type(request) is bytes:
+            request = m.decode(request)
+        m.validate_tree(request)
+        request = json.loads(m.canonical(request))  # detach caller-owned mutable objects
+        m.fields(request, "schema request_id operation body")
+        m.require(request["schema"] == "production-plane-v1", "Unsupported command schema")
+        m.identity(request["request_id"])
+        operation = request["operation"]
+        handlers = {"create": self._create, "cancel": self._cancel, "revise": self._revise,
+                    "queue": self._queue, "dispatch": self._dispatch, "respond": self._respond,
+                    "close_call": self._close_call, "observe": self._observe, "abandon": self._abandon,
+                    "learning_candidate": self._learning, "preflight_failure": self._preflight_failure,
+                    "not_started": self._not_started}
+        m.require(type(operation) is str and operation in handlers, "Unknown operation")
+        fingerprint = m.digest(request)
+        committing = False
+        try:
+            with self._connection() as db:
+                db.execute("BEGIN IMMEDIATE")
+                old = db.execute("SELECT fingerprint,result FROM receipts WHERE request_id=?", (request["request_id"],)).fetchone()
+                if old:
+                    m.require(old[0] == fingerprint, "Request ID already binds different content", "CONFLICT")
+                    db.rollback()
+                    return {"replayed": True, "receipt": json.loads(old[1])}
+                size = db.execute("PRAGMA page_count").fetchone()[0] * db.execute("PRAGMA page_size").fetchone()[0]
+                m.require(size + 8 * m.MAX_JSON <= m.MAX_STORE, "Control store limit reached", "LIMIT")
+                result = handlers[operation](db, request["body"], lease)
+                run_id = result["run_id"]
+                now = int(time.time())
+                seq = db.execute("INSERT INTO events(run_id,operation,body,recorded_at) VALUES (?,?,?,?)",
+                                 (run_id, operation, m.canonical(request["body"]).decode(), now)).lastrowid
+                receipt = {"store_id": self.identity["store_id"], "request_id": request["request_id"],
+                           "operation": operation, "recorded_at": now, "event_sequence": seq, "result": result}
+                db.execute("INSERT INTO receipts VALUES (?,?,?)", (request["request_id"], fingerprint, m.canonical(receipt).decode()))
+                committing = True
+                db.commit()
+                return {"replayed": False, "receipt": receipt}
+        except sqlite3.OperationalError as exc:
+            code = "BUSY" if "locked" in str(exc).lower() else "STORAGE_ERROR"
+            raise ControlError(code, "Local transaction could not be confirmed; retain request ID",
+                               commit_state="unknown" if committing else "not_committed") from exc
+        except sqlite3.Error as exc:
+            raise ControlError("STORE_INVALID", "Invalid persistent state",
+                               commit_state="unknown" if committing else "not_committed") from exc
+
+    @staticmethod
+    def _new_attempt(revision):
+        return {"attempt_id": str(uuid.uuid4()), "operation_id": str(uuid.uuid4()), "revision": revision,
+                "prepared_request": None, "submission_recorded": False, "observation": None}
+
+    def _create(self, db, body, lease):
+        m.specification(body)
+        m.require(db.execute("SELECT 1 FROM runs WHERE run_id=?", (body["run_id"],)).fetchone() is None,
+                  "Run already exists", "CONFLICT")
+        state = dict(body, revision=1, goal_digest=m.digest(body["goal"]), cancel=None,
+                     attempt=self._new_attempt(1), counters={"attempts": 0, "actions": 0, "queries": 0, "cancellations": 0})
+        m.validate_tree(state)
+        db.execute("INSERT INTO runs VALUES (?,?)", (body["run_id"], m.canonical(state).decode()))
+        return {"run_id": state["run_id"], "attempt_id": state["attempt"]["attempt_id"]}
+
+    def _cancel(self, db, body, lease):
+        m.fields(body, "run_id reason")
+        m.text(body["reason"], 2048)
+        state = self._load(db, body["run_id"])
+        if not state["cancel"]:
+            state["cancel"] = {"reason": body["reason"], "recorded_at": int(time.time())}
+            self._save(db, state)
+        return {"run_id": body["run_id"], "cancel_requested": True}
+
+    def _revise(self, db, body, lease):
+        m.fields(body, "run_id expected_revision plan")
+        m.plan(body["plan"])
+        state = self._load(db, body["run_id"])
+        m.natural(body["expected_revision"], high=100)
+        m.require(body["expected_revision"] == state["revision"], "Plan revision changed", "CONFLICT")
+        observation = state["attempt"]["observation"]
+        revisable = not state["attempt"]["submission_recorded"] or (
+            observation and observation["exited"] and observation["outcome"] == "FAILED")
+        m.require(not state["cancel"] and revisable,
+                  "Revise only before submission or after confirmed exited failure", "NOT_READY")
+        m.require(not self._pending(db, body["run_id"]), "Old calls remain unclosed", "PENDING")
+        m.require(state["revision"] < 100, "Plan revision limit reached", "LIMIT")
+        m.require(state["counters"]["attempts"] < state["budget"]["max_attempts"], "Business attempt budget exhausted", "LIMIT")
+        db.execute("INSERT INTO revisions VALUES (?,?,?)", (body["run_id"], state["revision"], m.canonical(state).decode()))
+        state["revision"] += 1
+        state["plan"] = body["plan"]
+        state["attempt"] = self._new_attempt(state["revision"])
+        self._save(db, state)
+        return {"run_id": body["run_id"], "revision": state["revision"], "attempt_id": state["attempt"]["attempt_id"]}
+
+    def _queue(self, db, body, lease):
+        m.fields(body, "run_id attempt_id action_id kind")
+        m.uuid4(body["action_id"])
+        m.require(type(body["kind"]) is str and body["kind"] in m.KINDS, "Unknown action kind")
+        state = self._load(db, body["run_id"])
+        attempt = state["attempt"]
+        m.require(body["attempt_id"] == attempt["attempt_id"], "Attempt changed", "CONFLICT")
+        m.require(db.execute("SELECT 1 FROM actions WHERE action_id=?", (body["action_id"],)).fetchone() is None,
+                  "Action already exists", "CONFLICT")
+        count = db.execute("SELECT count(*) FROM actions WHERE run_id=?", (body["run_id"],)).fetchone()[0]
+        m.require(count < 3000, "Action record limit reached", "LIMIT")
+        kind = body["kind"]
+        if kind in ("prepare", "submit"):
+            m.require(not state["cancel"] and not attempt["submission_recorded"], "New submission prohibited", "NOT_READY")
+        if kind == "prepare":
+            payload = {"operation_id": attempt["operation_id"], "kind": "workspace.edit",
+                       "profile_ref": state["binding"]["profile_ref"], "inputs": m.inputs(state["plan"])}
+        elif kind == "submit":
+            m.require(attempt["prepared_request"] is not None, "No prepared request", "NOT_READY")
+            payload = attempt["prepared_request"]
+        elif kind == "cancel":
+            m.require(state["cancel"] and attempt["submission_recorded"], "Cancellation requires a submitted attempt and local intent", "NOT_READY")
+            payload = {"operation_id": attempt["operation_id"], "request_digest": attempt["prepared_request"]["request_digest"], "target": {"kind": "job"}}
+        else:
+            payload = {"operation_id": attempt["operation_id"]}
+        action = dict(body, payload=payload, state="QUEUED", call_closed=False, response=None)
+        db.execute("INSERT INTO actions VALUES (?,?,?)", (body["action_id"], body["run_id"], m.canonical(action).decode()))
+        return {"run_id": body["run_id"], "action_id": body["action_id"]}
+
+    def _dispatch(self, db, body, lease):
+        m.fields(body, "action_id observed_binding")
+        action = self._action(db, body["action_id"])
+        state = self._load(db, action["run_id"])
+        m.binding(body["observed_binding"])
+        m.require(body["observed_binding"] == state["binding"], "Executor or archive binding differs", "IDENTITY_CONFLICT")
+        m.require(action["state"] == "QUEUED", "Action cannot be redelivered", "CONFLICT")
+        m.require(action["attempt_id"] == state["attempt"]["attempt_id"], "Action belongs to an older attempt", "CONFLICT")
+        kind = action["kind"]
+        if kind in ("prepare", "submit"):
+            m.require(isinstance(lease, _Lease), "Executor lease required", "LEASE_REQUIRED")
+            lease.verify(self)
+        if kind in ("prepare", "submit"):
+            m.require(not state["cancel"] and not state["attempt"]["submission_recorded"], "New submission prohibited", "NOT_READY")
+            m.require(time.time() < state["budget"]["deadline_utc"], "New execution deadline expired", "LIMIT")
+            m.require(not [a for a in self._pending(db, state["run_id"]) if a["kind"] != "query"], "Original call is not closed", "PENDING")
+            for other_id, document in db.execute("SELECT run_id,document FROM runs WHERE run_id!=?", (state["run_id"],)):
+                other = json.loads(document)
+                observed = other["attempt"]["observation"]
+                m.require(not other["attempt"]["submission_recorded"] or (observed and observed["exited"]),
+                          "Another run has an unresolved execution", "PENDING")
+                m.require(not [a for a in self._pending(db, other_id) if a["kind"] != "query"],
+                          "Another run has an unresolved call", "PENDING")
+        if kind == "submit":
+            m.require(action["payload"] == state["attempt"]["prepared_request"], "Prepared revision changed", "CONFLICT")
+            m.require(time.time() < action["payload"]["expires_at"], "Prepared request expired", "NOT_READY")
+            k = state["plan"]["knowledge"]
+            m.require(not k["required"] or k["status"] == "SELECTED", "Required knowledge unavailable", "NOT_READY")
+            self._spend(state, "attempts", "max_attempts")
+            state["attempt"]["submission_recorded"] = True
+        counter, bound = {"query": ("queries", "max_queries"), "cancel": ("cancellations", "max_cancellations")}.get(kind, ("actions", "max_actions"))
+        self._spend(state, counter, bound)
+        action["state"] = "MAY_HAVE_RUN"
+        self._save_action(db, action)
+        self._save(db, state)
+        return {"run_id": state["run_id"], "action_id": action["action_id"], "state": action["state"]}
+
+    @staticmethod
+    def _spend(state, counter, bound):
+        m.require(state["counters"][counter] < state["budget"][bound], "Persistent call budget exhausted", "LIMIT")
+        state["counters"][counter] += 1
+
+    def _respond(self, db, body, lease):
+        m.fields(body, "action_id response call_closed")
+        m.require(type(body["response"]) is dict and type(body["call_closed"]) is bool, "Invalid response observation")
+        action = self._action(db, body["action_id"])
+        state = self._load(db, action["run_id"])
+        m.require(action["state"] == "MAY_HAVE_RUN", "Action has no outstanding response", "CONFLICT")
+        m.require(len(m.canonical(body["response"])) <= state["budget"]["max_response_bytes"], "Response exceeds budget", "LIMIT")
+        if action["kind"] == "prepare" and body["response"].get("state") == "READY":
+            m.require(action["attempt_id"] == state["attempt"]["attempt_id"], "Prepared response belongs to older attempt", "CONFLICT")
+            m.require(not state["attempt"]["submission_recorded"], "Cannot replace a submitted request", "CONFLICT")
+            request = body["response"].get("request")
+            m.prepared(request, state)
+            state["attempt"]["prepared_request"] = request
+            self._save(db, state)
+        action.update(state="RESPONDED", response=body["response"], call_closed=body["call_closed"])
+        self._save_action(db, action)
+        return {"run_id": action["run_id"], "action_id": action["action_id"]}
+
+    def _close_call(self, db, body, lease):
+        m.fields(body, "action_id evidence_ref")
+        m.identity(body["evidence_ref"])
+        action = self._action(db, body["action_id"])
+        m.require(action["state"] == "RESPONDED", "Missing response; reconcile original call first", "PENDING")
+        action["call_closed"] = True
+        self._save_action(db, action)
+        return {"run_id": action["run_id"], "action_id": action["action_id"]}
+
+    def _abandon(self, db, body, lease):
+        m.fields(body, "action_id reason")
+        m.text(body["reason"], 2048)
+        action = self._action(db, body["action_id"])
+        m.require(action["state"] == "QUEUED", "Potentially sent action cannot be abandoned", "PENDING")
+        action.update(state="NOT_SENT", call_closed=True)
+        self._save_action(db, action)
+        return {"run_id": action["run_id"], "action_id": action["action_id"]}
+
+    def _preflight_failure(self, db, body, lease):
+        m.fields(body, "action_id code")
+        m.identity(body["code"])
+        action = self._action(db, body["action_id"])
+        m.require(action["state"] == "QUEUED", "Preflight failure must precede dispatch", "CONFLICT")
+        return {"run_id": action["run_id"], "action_id": action["action_id"], "state": "NOT_DISPATCHED"}
+
+    def _not_started(self, db, body, lease):
+        m.fields(body, "action_id evidence_ref")
+        m.identity(body["evidence_ref"])
+        action = self._action(db, body["action_id"])
+        state = self._load(db, action["run_id"])
+        m.require(action["state"] == "MAY_HAVE_RUN", "Call already has a result", "CONFLICT")
+        m.require(action["attempt_id"] == state["attempt"]["attempt_id"], "Attempt changed", "CONFLICT")
+        if action["kind"] == "submit":
+            m.require(state["attempt"]["observation"] is None, "Remote observation already exists", "CONFLICT")
+            state["attempt"]["submission_recorded"] = False
+            state["counters"]["attempts"] -= 1
+        counter = {"query": "queries", "cancel": "cancellations"}.get(action["kind"], "actions")
+        state["counters"][counter] -= 1
+        action.update(state="NOT_SENT", call_closed=True, response={"local_failure": "CALL_NOT_STARTED", "evidence_ref": body["evidence_ref"]})
+        self._save_action(db, action)
+        self._save(db, state)
+        return {"run_id": action["run_id"], "action_id": action["action_id"], "state": "NOT_SENT"}
+
+    def _observe(self, db, body, lease):
+        m.fields(body, "run_id attempt_id operation_id request_digest remote_state outcome exited evidence_state evidence_ref")
+        state = self._load(db, body["run_id"])
+        attempt = state["attempt"]
+        m.require(attempt["submission_recorded"] and attempt["prepared_request"], "No original submission to observe", "NOT_READY")
+        m.require(body["attempt_id"] == attempt["attempt_id"] and body["operation_id"] == attempt["operation_id"]
+                  and body["request_digest"] == attempt["prepared_request"]["request_digest"], "Observation identity mismatch", "IDENTITY_CONFLICT")
+        m.identity(body["evidence_ref"])
+        m.require(body["remote_state"] in ("NOT_FOUND", "RUNNING", "TERMINAL"), "Invalid remote state")
+        m.require(body["outcome"] in ("UNKNOWN", "SUCCEEDED", "FAILED", "CANCELLED"), "Invalid outcome")
+        m.require(body["evidence_state"] in ("UNKNOWN", "STAGING", "SEALED"), "Invalid evidence state")
+        m.require(type(body["exited"]) is bool, "exited must be boolean")
+        m.require(not body["exited"] or body["remote_state"] == "TERMINAL", "Exit requires terminal observation")
+        m.require(body["remote_state"] == "TERMINAL" or body["outcome"] == "UNKNOWN", "Nonterminal outcome must be unknown")
+        old = attempt["observation"]
+        if old and old["exited"]:
+            m.require(body["exited"] and body["remote_state"] == old["remote_state"]
+                      and (old["outcome"] == "UNKNOWN" or body["outcome"] == old["outcome"]),
+                      "Observation conflicts with retained terminal result", "CONFLICT")
+        attempt["observation"] = body
+        self._save(db, state)
+        return {"run_id": body["run_id"], "attempt_id": body["attempt_id"]}
+
+    def _learning(self, db, body, lease):
+        m.fields(body, "run_id attempt_id candidate_id explanation evidence_refs artifact_versions")
+        m.identity(body["candidate_id"])
+        m.text(body["explanation"], 8192)
+        state = self._load(db, body["run_id"])
+        m.require(body["attempt_id"] == state["attempt"]["attempt_id"], "Candidate attempt differs", "CONFLICT")
+        m.require(type(body["evidence_refs"]) is list and len(body["evidence_refs"]) <= 32, "Invalid evidence references")
+        m.require(type(body["artifact_versions"]) is list and len(body["artifact_versions"]) <= 32, "Invalid artifact versions")
+        m.require(body["evidence_refs"] or body["artifact_versions"], "Candidate requires recorded sources")
+        for ref in body["evidence_refs"]:
+            m.identity(ref)
+        for version in body["artifact_versions"]:
+            m.fields(version, "artifact_id version_id")
+            m.identity(version["artifact_id"])
+            m.identity(version["version_id"])
+        document = dict(body, goal_digest=state["goal_digest"], revision=state["revision"],
+                        operation_id=state["attempt"]["operation_id"], binding=state["binding"],
+                        delivery="UNCONFIGURED", admission="NOT_REQUESTED")
+        existing = db.execute("SELECT document FROM candidates WHERE candidate_id=?", (body["candidate_id"],)).fetchone()
+        if existing:
+            m.require(json.loads(existing[0]) == document, "Candidate ID binds other content", "CONFLICT")
+        else:
+            db.execute("INSERT INTO candidates VALUES (?,?,?)", (body["candidate_id"], body["run_id"], m.canonical(document).decode()))
+        return {"run_id": body["run_id"], "candidate_id": body["candidate_id"], "delivery": "UNCONFIGURED", "admission": "NOT_REQUESTED"}

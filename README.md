@@ -4,7 +4,7 @@
 
 它要解决的问题是：**一项任务交给执行器之后，如何持续推进，知道做到了哪一步，处理失败，并拿到能按原目标验收的成果。**
 
-当前处于首版设计阶段，尚未提供可安装的软件、命令行或运行服务。以下介绍目标用途与拟实现范围；具体交付步骤见[实施计划](docs/IMPLEMENTATION_PLAN.md)。
+**当前版本：`0.1.0a1` alpha · Linux / Python 3.12 · [MIT 许可](LICENSE)。** 已有可安装的运行记录核心、Python 库和本地 CLI，支持目标与计划、动作意图、取消、失败修订和接续检查。Local Hand 执行适配、Ledger 归档消费及真实任务验收仍待接通；下文的完整生产流程是首版目标。当前已实现入口见[开始使用](#开始使用)。
 
 ## 它负责什么
 
@@ -22,7 +22,7 @@
 
 <a id="与-local-handledger-的关系"></a>
 
-下表说明计划中的协作关系。Local Hand 和 Ledger 已有实现；P 与 K 仍处于设计阶段，尚未完成这些接入。
+下表说明计划中的协作关系。Local Hand 和 Ledger 已有实现；P 当前提供运行记录核心，K 仍处于设计阶段，尚未完成这些生产与知识接入。
 
 | 组件 | 主要职责与本仓关系 |
 | --- | --- |
@@ -53,10 +53,47 @@
 - 控制组件消费执行观察和验收决定；不会把“收到响应”“退出码为零”或“成果已保存”自动等同于目标完成。
 - 首版预留“读取已准入知识”和“回流学习候选”两个可选接口；知识缺席时能否继续，按任务预先确定的可选或必需条件判断。本仓库不实现完整知识系统。
 
+## 开始使用
+
+从源码构建并安装 wheel；尚未发布 PyPI 包。完整步骤见[安装与使用](docs/USAGE.md)。
+
+```sh
+python3.12 -m venv .venv
+.venv/bin/python -m pip install setuptools==84.0.0 wheel==0.48.0
+.venv/bin/python -m pip wheel --no-build-isolation --no-deps . -w dist
+.venv/bin/python -m pip install --no-deps dist/control_production_plane-0.1.0a1-py3-none-any.whl
+```
+
+首次体验可运行[本地记录示例](examples/local_records.py)，使用一个不存在的私有目录：
+
+```sh
+.venv/bin/python examples/local_records.py /absolute/private/new-production-records
+.venv/bin/production-plane --store /absolute/private/new-production-records show --run-id example
+.venv/bin/production-plane --store /absolute/private/new-production-records recover --run-id example
+```
+
+示例创建合成目标和计划，保存取消意图，再打开同一记录核对接续点；不会提交远程任务。`recover` 返回当前记录和下一步判断依据，本身不启动执行或重放动作。
+
+| 当前公共入口 | 用途 |
+| --- | --- |
+| `production-plane init` | 在新目录初始化私有运行记录 |
+| `production-plane write --request FILE` | 通过带请求 ID 的 JSON 命令保存本地变更 |
+| `production-plane show --run-id ID` | 查看当前目标、计划、尝试、取消意图和预算 |
+| `production-plane recover --run-id ID` | 读取原任务身份、未决调用和接续建议 |
+| `production-plane events --run-id ID` | 分页读取保留的原始命令历史 |
+| Python `initialize` / `open_store` | 显式创建或打开控制存储 |
+| Python `ControlStore.perform` | 为受信适配器保留调用意图、互斥和响应；需调用方提供适配器 |
+
+命令均需 `--store DIRECTORY`。已有目录、缺失或损坏的数据库不会被自动初始化覆盖。精确字段、调用闭合责任及错误处理见[公共接口](docs/INTERFACE.md)。
+
+当前记录核心不包含网络服务、真实执行器适配或成果验收入口。测试中的适配器响应是合成输入；实际部署身份、子进程退出、输出流完成和来源真实性仍须由后续适配器核验。
+
 ## 文档
 
 - [需求](docs/REQUIREMENTS.md)：为谁做、首版做什么、如何验收。
 - [架构](docs/ARCHITECTURE.md)：职责划分、接口方向、持久化与恢复。
 - [实施计划](docs/IMPLEMENTATION_PLAN.md)：实现顺序和与风险对应的验证。
+- [公共接口](docs/INTERFACE.md)：已有库、CLI、JSON 命令和持久化语义。
+- [安装与使用](docs/USAGE.md)：构建、独立安装、本地示例及恢复操作。
 
 开发过程、阶段记录和任务接续见[开发与接续记录](docs/DEVELOPMENT.md)；参与维护从 [AGENTS.md](AGENTS.md) 开始。
