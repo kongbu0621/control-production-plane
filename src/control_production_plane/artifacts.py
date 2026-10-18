@@ -11,6 +11,43 @@ from . import model as m
 from .calls import CliCalls, private_directory, publish, retained, response_json, sha
 
 
+def _evidence_description(value):
+    """Validate and detach caller input before retaining an immutable intent."""
+    m.validate_tree(value)
+    m.fields(value, "directory operation_id status_sha256 seal")
+    m.text(value["directory"], 4096)
+    m.require('\0' not in value["directory"] and Path(value["directory"]).is_absolute(),
+              "Evidence directory must be an absolute path")
+    m.identity(value["operation_id"])
+    m.sha(value["status_sha256"])
+    m.fields(value["seal"], "seal_id seal_sha256")
+    m.identity(value["seal"]["seal_id"])
+    m.sha(value["seal"]["seal_sha256"])
+    return json.loads(m.canonical(value))
+
+
+def _check_initial_status(state, evidence):
+    """Reject a mistaken first input before it can freeze the archive binding.
+
+    Existing intents keep their original snapshot. Completed receipts and public
+    resume must remain usable after the downloaded source files are unavailable.
+    """
+    raw = retained(Path(evidence["directory"])/'status.json')
+    m.require(sha(raw) == evidence["status_sha256"], "Initial status digest differs", "IDENTITY_CONFLICT")
+    status = response_json(raw)
+    request = state["attempt"]["prepared_request"]
+    m.require(request is not None and status.get("operation_id") == state["attempt"]["operation_id"]
+              and status.get("request_digest") == request["request_digest"]
+              and status.get("seal_refs") == [evidence["seal"]]
+              and all(status.get(k) == v for k,v in dict(
+                  lifecycle="TERMINAL", phase="EXITED", outcome="SUCCEEDED", evidence="SEALED").items()),
+              "Initial status differs from this successful sealed task", "IDENTITY_CONFLICT")
+    proof = status.get("exit_proof")
+    m.require(type(proof) is dict and all(proof.get(k) is True for k in (
+        "future_start_blocked", "tree_exited", "writers_stopped")),
+        "Initial status does not confirm task exit", "NOT_READY")
+
+
 def verify_readback(state, reply, directory, trusted):
     """Validate the bytes actually consumed, not just a CLI success flag."""
     from local_hand_jobs.evidence_client import verify_local_bundle
@@ -158,7 +195,7 @@ class ArtifactAdapter:
         observed = attempt["observation"]
         m.require(observed and observed["exited"] and observed["outcome"] == "SUCCEEDED"
                   and observed["evidence_state"] == "SEALED", "No successful sealed observation", "NOT_READY")
-        evidence = dict(evidence)
+        evidence = _evidence_description(evidence)
         m.require(evidence["operation_id"] == attempt["operation_id"], "Evidence task differs", "IDENTITY_CONFLICT")
         root = private_directory(self.root/attempt["attempt_id"])
         request = dict(run_id=run_id, attempt_id=attempt["attempt_id"], producer=state["binding"]["producer"],
@@ -166,6 +203,7 @@ class ArtifactAdapter:
         if (root/'archive.json').exists():
             m.require(response_json(retained(root/'archive.json')) == request, "Retained archive input differs", "CONFLICT")
         else:
+            _check_initial_status(state, evidence)
             publish(root/'archive.json', m.canonical(request))
         call_id = "archive-" + attempt["attempt_id"]
         args = ["archive", "--store", self.archive_store, "--producer", state["binding"]["producer"],

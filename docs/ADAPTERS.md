@@ -49,6 +49,10 @@
 
 各 CLI 成功响应都是 `{status: "OK", data: ...}`；传入下一步骤时使用所需的 data 字段，不能把整个信封当成业务对象。比如把 collect-evidence 的 stdout 保存为私有响应文件后，可在受信本地脚本中 `json.load(...)["data"]` 取得证据描述。
 
+归档证据描述恰含 `directory`、`operation_id`、`status_sha256` 和 `seal`；directory 是绝对路径，seal 恰含 `seal_id` 与 `seal_sha256`。首次保存归档输入前，适配器检查这些字段，并读取原 status.json 核对摘要、任务、请求、成功封存状态、seal 与退出证明。缺项、错路径、摘要或状态不符时，不保存不可变归档输入，也不启动归档 CLI；修正描述或本地可读性后可以继续。该核对不能代替来源认证，摘要和 seal 仍须来自前述 collect-evidence 的可信结果。
+
+已有归档输入继续绑定原描述。成功归档回执可直接复用，resume 从公共归档存储核对恢复；这两条路径不要求原下载文件仍然存在，不能因源文件后来不可读就重建任务或成果身份。
+
 候选只表示任务副本中的成果已经读回核对。要应用到开发工作区，仍须核对当前目标文件与基线；本适配器不自动应用、提交或合并 Git。
 
 ## 中断与失败接续
@@ -60,6 +64,7 @@
 | 完整 CLI 响应已保存、P 响应落账失败 | `reconcile-action` 从原始 bytes 和端点核验记录补记原动作；不再调用 CLI |
 | 控制进程被杀，原 CLI 或双流情况不明 | 保留原动作与缺口；沿原任务排队 query，必要时 cancel，不重提业务 |
 | submit 返回 IO_UNCERTAIN 或查询 NOT_FOUND | 核对原任务；不能据此退还业务额度或生成新任务 |
+| 首次归档的证据描述或原状态预检失败 | 修正输入后再调用 archive-result；未固定错误描述，未启动归档 CLI |
 | archive 完整返回 ERROR，且 CLI 已退出、双流 EOF 齐全 | 修正原因后可显式重调同输入的 `archive-result`；公共归档接口核对原 producer/operation 并复用已有写入，保留旧错误，不重跑业务 |
 | archive 超时、输出超限、丢响应或收集不完整 | 先确认旧 CLI 已停止，再 `resume-archive` 恢复原 producer/operation；不能把未知结果当成未执行 |
 | 归档 CLI 启动前失败 | 同原 archive-result 输入继续，保留每次未启动记录；未启动与完整 ERROR 共用最多 100 次接续额度 |

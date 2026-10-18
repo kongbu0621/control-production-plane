@@ -475,6 +475,102 @@ class AdapterTests(unittest.TestCase):
                 with self.assertRaises(ControlError):
                     self.artifacts.resume('example')
 
+    def unarchived_evidence(self):
+        with patch.object(ArtifactAdapter, 'archive', return_value=None):
+            evidence, _ = self.sealed()
+        return evidence
+
+    def test_invalid_evidence_description_cannot_freeze_first_archive_input(self):
+        evidence = self.unarchived_evidence()
+        cases = [None, [], dict(evidence, unexpected=True)]
+        for key in evidence:
+            cases.append({k:v for k,v in evidence.items() if k != key})
+        cases.extend(dict(evidence, **change) for change in (
+            {'directory':'relative/evidence'}, {'directory':None}, {'directory':'/bad\0path'},
+            {'directory':'/bad\ud800path'},
+            {'status_sha256':'invalid'}, {'seal':None}, {'seal':{}},
+            {'seal':dict(evidence['seal'],seal_sha256='invalid')},
+            {'seal':dict(evidence['seal'],seal_id='')},
+            {'operation_id':str(uuid.uuid4())}))
+        attempt = self.store.get_run('example')['attempt']['attempt_id']
+        for index, bad in enumerate(cases):
+            with self.subTest(index=index):
+                adapter = ArtifactAdapter(self.store, self.artifacts.command, self.artifacts.archive_store,
+                                          self.root/('invalid-descriptor-'+str(index)))
+                with patch.object(adapter.calls, 'run', wraps=adapter.calls.run) as run:
+                    with self.assertRaises(ControlError):
+                        adapter.archive('example', bad)
+                    run.assert_not_called()
+                self.assertFalse((adapter.root/attempt/'archive.json').exists())
+        # Continue on the same adapter that rejected the last malformed input.
+        corrected = adapter.archive('example', evidence)
+        self.assertTrue(corrected['content_verified'])
+        self.assertEqual(sum(r['tool']=='lh_job_submit' for r in self.requests), 1)
+
+    def test_status_binding_is_checked_before_first_archive_intent(self):
+        evidence = self.unarchived_evidence()
+        attempt = self.store.get_run('example')['attempt']['attempt_id']
+        status = response_json(retained(Path(evidence['directory'])/'status.json'))
+        cases = [('digest', dict(evidence,status_sha256='0'*64), None),
+                 ('seal', dict(evidence,seal=dict(evidence['seal'],seal_sha256='0'*64)), None)]
+        for key, value in (('operation_id',str(uuid.uuid4())), ('request_digest','0'*64),
+                           ('lifecycle','RUNNING'), ('phase','BUSINESS'), ('outcome','FAILED'),
+                           ('evidence','STAGING'), ('seal_refs', []), ('exit_proof', None),
+                           ('exit_proof', dict(status['exit_proof'],tree_exited=False))):
+            cases.append((key, evidence, dict(status, **{key:value})))
+        for label, description, wrong_status in cases:
+            with self.subTest(label=label):
+                description = copy.deepcopy(description)
+                if wrong_status is not None:
+                    directory = Path(tempfile.mkdtemp(prefix='wrong-status-'+label+'-', dir=self.root))
+                    raw = json.dumps(wrong_status).encode()
+                    publish(directory/'status.json', raw)
+                    description.update(directory=str(directory),status_sha256=hashlib.sha256(raw).hexdigest())
+                adapter = ArtifactAdapter(self.store, self.artifacts.command, self.artifacts.archive_store,
+                                          Path(tempfile.mkdtemp(prefix='status-check-'+label+'-', dir=self.root)))
+                with patch.object(adapter.calls, 'run', wraps=adapter.calls.run) as run:
+                    with self.assertRaises(ControlError):
+                        adapter.archive('example', description)
+                    run.assert_not_called()
+                self.assertFalse((adapter.root/attempt/'archive.json').exists())
+        corrected = adapter.archive('example', evidence)
+        self.assertTrue(corrected['content_verified'])
+        self.assertEqual(sum(r['tool']=='lh_job_submit' for r in self.requests), 1)
+
+    def test_completed_archive_receipt_and_resume_do_not_require_download_files(self):
+        evidence, archived = self.sealed()
+        for name in ('status.json', 'evidence.zip', 'evidence.manifest', 'evidence.seal'):
+            (Path(evidence['directory'])/name).unlink()
+        with patch.object(self.artifacts.calls, 'run', wraps=self.artifacts.calls.run) as run:
+            self.assertEqual(self.artifacts.archive('example', evidence), archived)
+            run.assert_not_called()
+            recovered = self.artifacts.resume('example')
+            self.assertEqual(run.call_count, 1)
+        self.assertEqual(recovered['version_id'], archived['version_id'])
+        self.assertTrue(recovered['content_verified'])
+
+    def test_archive_cli_rejects_bad_first_input_then_accepts_correction(self):
+        evidence = self.unarchived_evidence()
+        config = self.root/'archive-config.json'
+        publish(config, model.canonical(dict(command=self.artifacts.command,archive_store=self.artifacts.archive_store)))
+        supplied = self.root/'supplied-evidence.json'
+        publish(supplied, model.canonical({k:v for k,v in evidence.items() if k != 'seal'}))
+        argv = [sys.executable, '-m', 'control_production_plane.cli', '--store', str(self.root/'control'),
+            'archive-result', '--adapter', str(config), '--data', str(self.artifacts.root),
+            '--run-id', 'example', '--evidence', str(supplied)]
+        failed = subprocess.run(argv, capture_output=True, timeout=15)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(json.loads(failed.stderr)['error']['code'], 'INVALID_INPUT')
+        attempt = self.store.get_run('example')['attempt']['attempt_id']
+        self.assertFalse((self.artifacts.root/attempt/'archive.json').exists())
+        supplied.write_bytes(model.canonical(evidence))
+        completed = subprocess.run(argv, capture_output=True, timeout=15)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        archived = json.loads(completed.stdout)['data']
+        self.assertEqual(archived['status'], 'ARCHIVED')
+        self.assertTrue(archived['content_verified'])
+        self.assertEqual(sum(r['tool']=='lh_job_submit' for r in self.requests), 1)
+
     def archive_exit_wrapper(self, *, timeout=False):
         # Actual public archive CLI commits first; alter only its final delivery.
         wrapper = self.root/'archive-cli.py'
