@@ -585,6 +585,77 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), original)
         self.assertEqual(sum(r['tool']=='lh_job_submit' for r in self.requests), 1)
 
+    def test_read_and_resume_reject_mismatched_original_archive_identity(self):
+        _, archived = self.sealed()
+        state = self.store.get_run('example')
+        path = self.artifacts.root/state['attempt']['attempt_id']/'archive.json'
+        saved = path.read_bytes(); original = response_json(saved)
+        changes = [dict(original, **{key:'another:'+str(uuid.uuid4())})
+                   for key in ('run_id','attempt_id','producer','archive_id')]
+        changes.append(dict(original,evidence=dict(original['evidence'],operation_id=str(uuid.uuid4()))))
+        calls = set(self.artifacts.calls.root.iterdir())
+        for index, wrong in enumerate(changes):
+            with self.subTest(index=index):
+                path.write_bytes(model.canonical(wrong))
+                output = self.root/('wrong-archive-identity-'+str(index))
+                try:
+                    with patch.object(self.artifacts.calls,'run',wraps=self.artifacts.calls.run) as run:
+                        with self.assertRaises(ControlError):
+                            self.artifacts.resume('example')
+                        with self.assertRaises(ControlError):
+                            self.artifacts.read('example',artifact_id=archived['artifact_id'],
+                                version_id=archived['version_id'],output=output)
+                        run.assert_not_called()
+                    self.assertEqual(self.store.get_run('example'),state)
+                    self.assertEqual(set(self.artifacts.calls.root.iterdir()),calls)
+                    self.assertFalse(output.exists())
+                finally:
+                    path.write_bytes(saved)
+        read = self.artifacts.read('example',artifact_id=archived['artifact_id'],
+            version_id=archived['version_id'],output=self.root/'restored-archive-identity-read')
+        self.assertEqual(read['files'],archived['files'])
+        self.assertEqual(path.read_bytes(),saved)
+        self.assertEqual(sum(r['tool']=='lh_job_submit' for r in self.requests),1)
+
+    def test_archive_paths_validate_retained_input_without_requiring_source_files(self):
+        evidence, archived = self.sealed()
+        state = self.store.get_run('example')
+        path = self.artifacts.root/state['attempt']['attempt_id']/'archive.json'
+        saved = path.read_bytes(); original = response_json(saved)
+        cases = [dict(original,unexpected=True)]
+        cases.extend({k:v for k,v in original.items() if k != key} for key in original)
+        cases.extend(dict(original,evidence=wrong) for wrong in (None, [], {},
+            dict(evidence,directory='relative/path'), dict(evidence,status_sha256='invalid'),
+            dict(evidence,seal={}),dict(evidence,unexpected=True)))
+        calls = set(self.artifacts.calls.root.iterdir())
+        for index, wrong in enumerate(cases):
+            with self.subTest(index=index):
+                path.write_bytes(model.canonical(wrong))
+                output = self.root/('malformed-archive-input-'+str(index))
+                try:
+                    with patch.object(self.artifacts.calls,'run',wraps=self.artifacts.calls.run) as run:
+                        with self.assertRaises(ControlError):self.artifacts.archive('example',evidence)
+                        with self.assertRaises(ControlError):self.artifacts.resume('example')
+                        with self.assertRaises(ControlError):
+                            self.artifacts.read('example',artifact_id=archived['artifact_id'],
+                                version_id=archived['version_id'],output=output)
+                        run.assert_not_called()
+                    self.assertEqual(set(self.artifacts.calls.root.iterdir()),calls)
+                    self.assertEqual(self.store.get_run('example'),state)
+                    self.assertFalse(output.exists())
+                finally:
+                    path.write_bytes(saved)
+        for name in ('status.json','evidence.zip','evidence.manifest','evidence.seal'):
+            (Path(evidence['directory'])/name).unlink()
+        self.assertEqual(self.artifacts.archive('example',evidence),archived)
+        resumed = self.artifacts.resume('example')
+        self.assertEqual(resumed['version_id'],archived['version_id'])
+        read = self.artifacts.read('example',artifact_id=archived['artifact_id'],
+            version_id=archived['version_id'],output=self.root/'restored-input-read')
+        self.assertEqual(read['files'],archived['files'])
+        self.assertEqual(path.read_bytes(),saved)
+        self.assertEqual(sum(r['tool']=='lh_job_submit' for r in self.requests),1)
+
     def test_invalid_receipt_is_rejected_before_public_read(self):
         _, archived = self.sealed()
         state = self.store.get_run('example')

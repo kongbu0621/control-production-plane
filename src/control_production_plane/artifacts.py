@@ -223,6 +223,19 @@ class ArtifactAdapter:
             publish(path, raw)
         return result
 
+    def _archive_input(self, state):
+        """Check the retained intent in every archive recovery/consumption path."""
+        attempt = state['attempt']
+        original = response_json(retained(self.root/attempt['attempt_id']/'archive.json'))
+        m.fields(original, 'run_id attempt_id producer archive_id evidence')
+        evidence = _evidence_description(original['evidence'])
+        m.require(original['run_id'] == state['run_id'] and original['attempt_id'] == attempt['attempt_id']
+                  and original['producer'] == state['binding']['producer']
+                  and original['archive_id'] == state['binding']['archive_id']
+                  and evidence['operation_id'] == attempt['operation_id'],
+                  "Original archive binding differs", "IDENTITY_CONFLICT")
+        return dict(original, evidence=evidence)
+
     @serial
     def archive(self, run_id, evidence):
         state = self.store.get_run(run_id)
@@ -236,7 +249,7 @@ class ArtifactAdapter:
         request = dict(run_id=run_id, attempt_id=attempt["attempt_id"], producer=state["binding"]["producer"],
                        archive_id=state["binding"]["archive_id"], evidence=evidence)
         if (root/'archive.json').exists():
-            m.require(response_json(retained(root/'archive.json')) == request, "Retained archive input differs", "CONFLICT")
+            m.require(self._archive_input(state) == request, "Retained archive input differs", "CONFLICT")
         else:
             _check_initial_status(state, evidence)
             publish(root/'archive.json', m.canonical(request))
@@ -250,12 +263,7 @@ class ArtifactAdapter:
     def resume(self, run_id):
         state = self.store.get_run(run_id)
         attempt = state["attempt"]
-        original = response_json(retained(self.root/attempt['attempt_id']/'archive.json'))
-        m.require(original['run_id'] == run_id and original['attempt_id'] == attempt['attempt_id']
-                  and original['producer'] == state['binding']['producer']
-                  and original['archive_id'] == state['binding']['archive_id']
-                  and original['evidence']['operation_id'] == attempt['operation_id'],
-                  "Original archive binding differs", "IDENTITY_CONFLICT")
+        self._archive_input(state)
         m.require(self.calls.stopped("archive-" + attempt['attempt_id']),
                   "Original archive CLI has no stop proof", "PENDING")
         result = self._call(["resume", "--store", self.archive_store, "--producer", state["binding"]["producer"],
@@ -268,7 +276,7 @@ class ArtifactAdapter:
         m.identity(artifact_id); m.identity(version_id)
         output = Path(output).absolute()
         m.require(not output.exists(), "Read-back output must be new; retain earlier outputs", "ALREADY_EXISTS")
-        original = response_json(retained(self.root/state["attempt"]["attempt_id"]/'archive.json'))
+        original = self._archive_input(state)
         receipt_path = self.root/state['attempt']['attempt_id']/'receipt.json'
         try:
             raw_receipt = retained(receipt_path)
