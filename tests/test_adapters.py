@@ -277,6 +277,87 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(self.store.get_run('example')['attempt']['observation']['remote_state'], 'RUNNING')
         self.assertEqual(sum(r['tool'] == 'lh_job_submit' for r in self.requests), 1)
 
+    def late_status(self, kind, *, unrecorded=True, wrong=None, revise_twice=False):
+        self.perform('prepare')
+        if kind == 'query':
+            self.perform('submit')
+        action = self.queue(kind)
+        real_handler = self.handler
+        if wrong:
+            def malformed(tool, args):
+                value = real_handler(tool, args)
+                if tool == {'submit': 'lh_job_submit', 'query': 'lh_job_status'}[kind]:
+                    value = dict(value, **wrong)
+                return value
+            self.handler = malformed
+            with self.assertRaises(ControlError):
+                self.adapter.perform(action)
+            self.handler = real_handler
+        elif unrecorded:
+            # Complete CLI bytes survive a local conversion/read failure.
+            with patch.object(self.adapter, '_summary', side_effect=ControlError('STORAGE_ERROR', 'Synthetic local read failure')):
+                with self.assertRaises(ControlError):
+                    self.adapter.perform(action)
+        else:
+            self.adapter.perform(action)
+        self.assertTrue(self.store.get_action(action)['call_closed'])
+        if unrecorded or wrong:
+            self.assertIn('transport_error', self.store.get_action(action)['response'])
+        self.status = dict(operation_id=self.request['operation_id'], request_digest=self.request['request_digest'],
+            lifecycle='TERMINAL', outcome='FAILED', phase='EXITED', evidence='STAGING',
+            exit_proof=dict(future_start_blocked=True, tree_exited=True, writers_stopped=True))
+        self.perform('query')
+        plan = dict(self.spec['plan'], content="print('revised')\n")
+        self.store.execute(command('revise', dict(run_id='example', expected_revision=1, plan=plan)))
+        original = self.store.get_revision('example', 1)
+        if revise_twice:
+            self.store.execute(command('revise', dict(run_id='example', expected_revision=2, plan=plan)))
+        del self.status
+        self.perform('prepare'); self.perform('submit')
+        return action, original
+
+    def check_late_status(self, action, original):
+        current = self.store.get_run('example'); calls = len(self.requests)
+        raw = self.adapter.calls.read(action)
+        recovered = self.adapter.reconcile(action)
+        def event_history():
+            result = []
+            while True:
+                page = self.store.events('example', after=result[-1]['sequence'] if result else 0)
+                if not page:
+                    return result
+                result.extend(page)
+        events = event_history()
+        self.adapter.reconcile(action)
+        self.assertEqual(recovered['response']['observation']['operation_id'], original['attempt']['operation_id'])
+        self.assertEqual(recovered['response']['observation']['remote_state'], 'RUNNING')
+        self.assertEqual(recovered['response']['observation']['request_digest'], original['attempt']['prepared_request']['request_digest'])
+        self.assertEqual(self.store.get_run('example'), current)
+        self.assertEqual(self.store.get_revision('example', 1), original)
+        self.assertEqual(self.adapter.calls.read(action), raw)
+        self.assertEqual(len(self.requests), calls)
+        self.assertEqual(event_history(), events)
+
+    def test_old_query_response_reconciles_after_new_submission(self):
+        self.check_late_status(*self.late_status('query', revise_twice=True))
+
+    def test_old_submit_response_reconciles_after_new_submission(self):
+        self.check_late_status(*self.late_status('submit'))
+
+    def test_confirmed_old_status_reconcile_remains_idempotent(self):
+        self.check_late_status(*self.late_status('query', unrecorded=False))
+
+    def test_old_status_still_requires_original_request_identity(self):
+        action, original = self.late_status('query', wrong={'request_digest': '0' * 64})
+        current = self.store.get_run('example'); before = self.store.get_action(action); calls = len(self.requests)
+        with self.assertRaises(ControlError) as error:
+            self.adapter.reconcile(action)
+        self.assertEqual(error.exception.code, 'IDENTITY_CONFLICT')
+        self.assertEqual(self.store.get_action(action), before)
+        self.assertEqual(self.store.get_run('example'), current)
+        self.assertEqual(self.store.get_revision('example', 1), original)
+        self.assertEqual(len(self.requests), calls)
+
     def sealed(self, *, extra_change=False):
         from local_hand_jobs.evidence import EvidenceStore,FrozenSnapshot,QuiescenceProof
         self.perform('prepare');self.perform('submit')

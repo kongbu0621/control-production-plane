@@ -139,6 +139,19 @@ class LocalHandAdapter:
 
     def _summary(self, action, value, result, digest):
         state = self.store.get_run(action["run_id"])
+        if state["attempt"]["attempt_id"] != action["attempt_id"]:
+            # A closed call can be reconciled after a later query established
+            # exit and the plan was revised. Bind its bytes to its own immutable
+            # revision, never to the current attempt's request or plan.
+            for revision in range(state["revision"] - 1, 0, -1):
+                original = self.store.get_revision(action["run_id"], revision)
+                if original["attempt"]["attempt_id"] == action["attempt_id"]:
+                    state = original
+                    break
+            else:
+                raise m.ControlError("IDENTITY_CONFLICT", "Original action attempt is unavailable")
+        m.require(state["attempt"]["operation_id"] == action["payload"]["operation_id"],
+                  "Action differs from its original attempt", "IDENTITY_CONFLICT")
         summary = dict(call_id=result["call_id"], response_sha256=digest)
         if "remote_error" in value:
             return dict(summary, remote_error=value["remote_error"])
