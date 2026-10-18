@@ -5,6 +5,7 @@ The caller is trusted: this journal records adoption, never grants authority.
 """
 import hashlib
 import json
+import re
 from pathlib import Path
 
 from . import model as m
@@ -13,6 +14,25 @@ from . import model as m
 def encoded(value):
     # K's public canonical request fingerprint uses UTF-8, unlike P's ASCII.
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+
+
+def context_value(value):
+    """Validate the public K context contract before persisting an intent."""
+    m.validate_tree(value)
+    m.require(type(value) is dict and len(value) <= 16, "K context must have at most 16 fields")
+    for name, item in value.items():
+        m.require(re.fullmatch(r"[a-z][a-z0-9_]{0,31}", name) is not None, "Invalid K context key")
+        m.text(item, 256)
+        m.require("\x00" not in item, "K context values cannot contain NUL")
+    return json.loads(encoded(value))
+
+
+def condition_scope(conditions):
+    text = json.dumps(conditions, ensure_ascii=False, sort_keys=True)
+    # K permits 16 * 256-byte values; P's human-readable scope is 2048 bytes.
+    if len(text.encode()) > 2048:
+        return "conditions-sha256:" + hashlib.sha256(encoded(conditions)).hexdigest()
+    return text
 
 
 def key(store_id, state, operation):
@@ -52,10 +72,28 @@ def feedback_material(store_id, state, usage, notes):
                  plan_sha256=m.digest(state["plan"]), submission_recorded=attempt["submission_recorded"],
                  observation=observed, candidate=attempt.get("candidate"), decision=attempt.get("decision"),
                  cancel=state["cancel"], maintenance_stop=attempt.get("maintenance_stop"), notes=notes)
+    raw = encoded(facts)
+    if len(raw) > 65536:
+        # Preserve exact references to the immutable P candidate/decision; do
+        # not send a valid P record larger than K's public material text bound.
+        facts["snapshot_format"] = "bounded-references-v1"
+        facts["full_snapshot_sha256"] = hashlib.sha256(raw).hexdigest()
+        if facts["candidate"] is not None:
+            candidate = facts["candidate"]
+            facts["candidate"] = {k: candidate[k] for k in (
+                "run_id", "attempt_id", "artifact_id", "version_id", "readback_ref", "receipt_sha256", "goal_digest", "revision")}
+            facts["candidate"].update(document_sha256=m.digest(candidate), source_sha256=m.digest(candidate["source"]))
+        if facts["decision"] is not None:
+            decision = facts["decision"]
+            facts["decision"] = dict(decision, document_sha256=m.digest(decision), checks=[
+                dict(condition_sha256=hashlib.sha256(c["condition"].encode()).hexdigest(),
+                     passed=c["passed"], evidence_ref=c["evidence_ref"]) for c in decision["checks"]])
+        raw = encoded(facts)
+    m.require(len(raw) <= 65536, "Feedback exceeds K material text limit", "LIMIT")
     return dict(material_id=key(store_id, state, "feedback-material"), source_ref=usage["consumer_ref"],
                 task_ref=usage["task_ref"], context=usage["context"], claimed_outcome=outcome,
                 gaps=["Acceptance is recorded separately from execution outcome; inspect the retained P facts."],
-                text=encoded(facts).decode())
+                text=raw.decode())
 
 
 def record_intent(store, db, body):
@@ -91,7 +129,7 @@ def record_intent(store, db, body):
         m.fields(value, "usage_id consumer_ref task_ref version_id context")
         m.require(value["usage_id"] == cid and value["consumer_ref"] == consumer and value["task_ref"] == task
                   and value["version_id"] == k["items"][0]["version_id"], "Knowledge use differs from original plan", "CONFLICT")
-        m.require(type(value["context"]) is dict, "Expected K context")
+        context_value(value["context"])
         state["attempt"]["knowledge_use"] = cid
     else:
         use = calls.get(key(store.identity["store_id"], original, "start_use"))
@@ -151,15 +189,16 @@ class KnowledgeAdapter:
         return k
 
     def query(self, kind, context, *, after="", limit=10):
-        return self._open().query(kind, context, after=after, limit=limit)
+        return self._open().query(kind, context_value(context), after=after, limit=limit)
 
     def selection(self, version_id, context):
+        context = context_value(context)
         value = self._open().get("version", version_id)
         v = value["record"]
         m.require(v["state"] == "ACTIVE" and all(context.get(k) == x for k, x in v["conditions"].items())
                   and all(x["status"] == "VERIFIED" for x in value["materials"]), "Knowledge unavailable for new adoption", "NOT_READY")
         item = dict(knowledge_id=v["lineage_id"], version_id=v["version_id"], content_sha256=hashlib.sha256(v["content"].encode()).hexdigest(),
-                    admission_ref=v["review_id"], scope=json.dumps(v["conditions"], ensure_ascii=False, sort_keys=True))
+                    admission_ref=v["review_id"], scope=condition_scope(v["conditions"]))
         return dict(item=item, content=v["content"], conditions=v["conditions"])
 
     def _command(self, op, body, suffix):
@@ -173,6 +212,7 @@ class KnowledgeAdapter:
         return req["request_id"]
 
     def adopt(self, run_id, context):
+        context = context_value(context)
         with self.store.executor() as lease:
             state = self.store.get_run(run_id)
             cid = key(self.store.identity["store_id"], state, "start_use")
@@ -221,6 +261,14 @@ class KnowledgeAdapter:
         except KnowledgeError as exc:
             if exc.code != "NOT_FOUND":
                 raise
+            # The read above may block while another caller cancels/revises P.
+            # Re-read after it, before considering any new K write. A later
+            # cancellation can still race with the K call; P submission keeps
+            # its own transactional cancellation barrier.
+            current = self.store.get_run(run_id)
+            m.require(current.get("knowledge_calls", {}).get(call_id) == call,
+                      "Original K call changed during lookup; inspect it again", "CONFLICT")
+            state = current
             # A lost K store must never silently recreate a committed call.
             m.require(call["state"] != "COMMITTED", "Committed K receipt is missing", "IDENTITY_CONFLICT")
             if req["operation"] == "start_use":
