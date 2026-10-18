@@ -1,6 +1,6 @@
 # 维护与接续
 
-先读 [README](README.md)、[需求](docs/REQUIREMENTS.md)、[架构](docs/ARCHITECTURE.md)和[实施计划](docs/IMPLEMENTATION_PLAN.md)。当前已有 `0.1.0a2` 运行记录核心、库与 CLI，以及 Local Hand/Ledger 静态适配器；合成任务集成验证已完成，原部署的一次真实 README 候选已执行、归档、按指定版本读回并明确 ACCEPT；候选未应用到原工作区，完整现场故障边界与生产资格尚未完成。实现字段见 [公共接口](docs/INTERFACE.md)，运行方式见[使用说明](docs/USAGE.md)。当前决定、来源基线和待办见[开发与接续记录](docs/DEVELOPMENT.md)。
+先读 [README](README.md)、[需求](docs/REQUIREMENTS.md)、[架构](docs/ARCHITECTURE.md)和[实施计划](docs/IMPLEMENTATION_PLAN.md)。当前已有 `0.1.0a2` 运行记录核心、库与 CLI，以及 Local Hand/Ledger 静态适配器；合成任务集成验证已完成，原部署的一次真实 README 候选已执行、归档、按指定版本读回并明确 ACCEPT；候选未应用到原工作区。现场已验证 P 响应落账前中断恢复、准备阶段停止推进、业务启动前取消及完成后取消保留结果；实际业务 helper 运行中取消仍受任务盘 inode 配额容量阻塞，按开发记录接续，完整现场故障边界与生产资格尚未完成。实现字段见 [公共接口](docs/INTERFACE.md)，运行方式见[使用说明](docs/USAGE.md)。当前决定、来源基线和待办见[开发与接续记录](docs/DEVELOPMENT.md)。
 
 ## 当前方向
 
