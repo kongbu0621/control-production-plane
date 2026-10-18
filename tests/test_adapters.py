@@ -67,6 +67,31 @@ class CallTests(unittest.TestCase):
         with self.assertRaises(ControlError):
             self.calls.read(result['call_id'])
 
+    def test_missing_call_read_does_not_create_an_unresolved_call(self):
+        with self.assertRaises((OSError, ControlError)):
+            self.calls.read('never-started')
+        self.assertFalse((self.calls.root/'never-started').exists())
+        with self.calls.serial():
+            result = self.calls.run([sys.executable, '-c', 'print("usable")'])
+        self.assertEqual(self.calls.read(result['call_id']), b'usable\n')
+
+    def test_retained_fifo_is_rejected_without_waiting_for_a_writer(self):
+        path = self.root/'invalid-retained-file'
+        os.mkfifo(path, 0o600)
+        code = '''import sys
+from control_production_plane.calls import retained
+from control_production_plane import ControlError
+try:
+    retained(sys.argv[1])
+except ControlError as error:
+    assert error.code == "STORE_INVALID", error.code
+else:
+    raise AssertionError("FIFO accepted")
+'''
+        result = subprocess.run([sys.executable, '-c', code, str(path)],
+                                capture_output=True, timeout=2)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_orphan_child_blocks_archive_until_actual_exit(self):
         # Real detached child identity; releasing the owner lock proves nothing.
         child = subprocess.Popen([sys.executable, '-c', 'import time;time.sleep(30)'])
@@ -255,7 +280,8 @@ class AdapterTests(unittest.TestCase):
             seal_refs=[{k:descriptor[k] for k in ('seal_id','seal_sha256')}])
         action=self.perform('query')
         evidence=self.adapter.download(action,self.root/'download')
-        self.artifacts=ArtifactAdapter(self.store,[sys.executable,'-I','-B','-m','local_hand_jobs.artifact_archive'],self.root/'archive',self.root/'artifacts')
+        archive_command = getattr(self, 'archive_command', [sys.executable,'-I','-B','-m','local_hand_jobs.artifact_archive'])
+        self.artifacts=ArtifactAdapter(self.store,archive_command,self.root/'archive',self.root/'artifacts')
         archived=self.artifacts.archive('example',evidence)
         return evidence,archived
 
@@ -408,6 +434,113 @@ class AdapterTests(unittest.TestCase):
         second=self.artifacts.archive('example',evidence)
         self.assertEqual(first,second)
         self.assertEqual(sum(r['tool']=='lh_job_submit' for r in self.requests),1)
+
+    def test_archive_completed_input_failure_can_continue_with_original_inputs(self):
+        original = CliCalls.run
+        def invalid_input(calls, argv, **kwargs):
+            if 'local_hand_jobs.artifact_archive' not in argv:
+                return original(calls, argv, **kwargs)
+            path = Path(argv[argv.index('--evidence-dir') + 1])/'evidence.zip'
+            saved = path.with_name('temporarily-unavailable.zip')
+            path.rename(saved)
+            try:
+                return original(calls, argv, **kwargs)
+            finally:
+                saved.rename(path)
+        with patch.object(CliCalls, 'run', invalid_input), self.assertRaises(ControlError) as failed:
+            self.sealed()
+        self.assertEqual(failed.exception.code, 'ARCHIVE_ERROR')
+        state = self.store.get_run('example')
+        call_id = 'archive-' + state['attempt']['attempt_id']
+        directory = self.artifacts.calls.root/call_id
+        retained_failure = {p.name:p.read_bytes() for p in directory.iterdir()}
+        result = response_json(retained(directory/'result.json'))
+        self.assertTrue(result['call_closed'])
+        self.assertEqual(result['exit_code'], 1)
+        self.assertFalse(Path(self.artifacts.archive_store).exists())
+        evidence = response_json(retained(self.artifacts.root/state['attempt']['attempt_id']/'archive.json'))['evidence']
+        recovered = self.artifacts.archive('example', evidence)
+        self.assertTrue(recovered['content_verified'])
+        self.assertEqual(recovered, self.artifacts.archive('example', evidence))
+        self.assertEqual(retained_failure, {p.name:p.read_bytes() for p in directory.iterdir()})
+        self.assertEqual(sum(r['tool']=='lh_job_submit' for r in self.requests), 1)
+        read = self.artifacts.read('example', artifact_id=recovered['artifact_id'],
+            version_id=recovered['version_id'], output=self.root/'recovered-read')
+        self.assertEqual(read['use']['consumed_after_sha256'], hashlib.sha256(state['plan']['content'].encode()).hexdigest())
+
+    def test_resumed_archive_receipt_requires_verified_content_and_exact_ids(self):
+        _, archived = self.sealed()
+        for change in ({'content_verified':False}, {'artifact_id':None}, {'version_id':''}):
+            with self.subTest(change=change), patch.object(self.artifacts, '_call', return_value=dict(archived, **change)):
+                with self.assertRaises(ControlError):
+                    self.artifacts.resume('example')
+
+    def archive_exit_wrapper(self, *, timeout=False):
+        # Actual public archive CLI commits first; alter only its final delivery.
+        wrapper = self.root/'archive-cli.py'
+        wrapper.write_text('''import contextlib, io, json, sys, time
+from pathlib import Path
+from local_hand_jobs.artifact_archive import main
+output = io.StringIO()
+with contextlib.redirect_stdout(output):
+    code = main(sys.argv[1:])
+saved = Path(__file__).with_name("committed-receipt.json")
+if sys.argv[1] == "archive" and code == 0 and not saved.exists():
+    saved.write_text(output.getvalue())
+    if TIMEOUT:
+        time.sleep(30)
+    print(json.dumps(dict(status="ERROR", code="SYNTHETIC_DELIVERY_ERROR", commit_state="committed")))
+    raise SystemExit(1)
+print(output.getvalue(), end="")
+raise SystemExit(code)
+'''.replace('TIMEOUT', repr(timeout)))
+        self.archive_command = [sys.executable, '-I', '-B', str(wrapper)]
+
+    def test_archive_completed_error_after_commit_reuses_original_version(self):
+        self.archive_exit_wrapper()
+        with self.assertRaises(ControlError) as failed:
+            self.sealed()
+        self.assertEqual(failed.exception.code, 'ARCHIVE_ERROR')
+        first = json.loads((self.root/'committed-receipt.json').read_bytes())
+        state = self.store.get_run('example')
+        evidence = response_json(retained(self.artifacts.root/state['attempt']['attempt_id']/'archive.json'))['evidence']
+        changed = dict(evidence, status_sha256='0'*64)
+        with patch.object(self.artifacts.calls, 'run', wraps=self.artifacts.calls.run) as run:
+            with self.assertRaises(ControlError):
+                self.artifacts.archive('example', changed)
+            run.assert_not_called()
+            recovered = self.artifacts.archive('example', evidence)
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(recovered, self.artifacts.archive('example', evidence))
+            self.assertEqual(run.call_count, 1)
+        self.assertTrue(recovered['reused'])
+        for key in ('artifact_id', 'version_id', 'operation_id', 'producer', 'files'):
+            self.assertEqual(recovered[key], first[key])
+        self.assertEqual(sum(r['tool']=='lh_job_submit' for r in self.requests), 1)
+
+    def test_archive_timeout_requires_resume_instead_of_another_archive(self):
+        self.archive_exit_wrapper(timeout=True)
+        original = CliCalls.run
+        def short_timeout(calls, argv, **kwargs):
+            if 'archive' in argv:
+                calls.timeout = 1
+            return original(calls, argv, **kwargs)
+        with patch.object(CliCalls, 'run', short_timeout), self.assertRaises(ControlError) as failed:
+            self.sealed()
+        self.assertEqual(failed.exception.code, 'CALL_UNKNOWN')
+        first = json.loads((self.root/'committed-receipt.json').read_bytes())
+        state = self.store.get_run('example')
+        evidence = response_json(retained(self.artifacts.root/state['attempt']['attempt_id']/'archive.json'))['evidence']
+        self.artifacts.calls.timeout = 60
+        with patch.object(self.artifacts.calls, 'run', wraps=self.artifacts.calls.run) as run:
+            with self.assertRaises(ControlError) as blocked:
+                self.artifacts.archive('example', evidence)
+            self.assertEqual(blocked.exception.code, 'CALL_UNKNOWN')
+            run.assert_not_called()
+            recovered = self.artifacts.resume('example')
+            self.assertEqual(run.call_count, 1)
+        self.assertEqual(recovered['version_id'], first['version_id'])
+        self.assertEqual(sum(r['tool']=='lh_job_submit' for r in self.requests), 1)
 
     def test_unsupported_candidate_path_is_refused_before_preparation(self):
         plan=copy.deepcopy(self.spec['plan']);plan['relative_path']='内容.py'

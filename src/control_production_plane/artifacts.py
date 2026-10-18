@@ -14,7 +14,7 @@ from .calls import CliCalls, private_directory, publish, retained, response_json
 def verify_readback(state, reply, directory, trusted):
     """Validate the bytes actually consumed, not just a CLI success flag."""
     from local_hand_jobs.evidence_client import verify_local_bundle
-    root = private_directory(directory)
+    root = private_directory(directory, create=False)
     m.require(reply.get("status") == "READ" and reply.get("content_verified") is True,
               "Archive read did not confirm content", "PROTOCOL_ERROR")
     expected = {"evidence.zip", "evidence.manifest", "evidence.seal", "status.json", "source.json"}
@@ -109,11 +109,24 @@ class ArtifactAdapter:
         argv = self.command + args
         base_id = call_id
         for retry in range(101):
-            if not directory.exists() or not (directory/'not-started.json').exists():
+            if not directory.exists():
                 break
             original = response_json(retained(directory/'intent.json'))
-            m.require(original['argv'] == argv, "Original nonstarted call differs", "CONFLICT")
-            m.require(retry < 100, "Local startup retry budget exhausted", "LIMIT")
+            m.require(original['argv'] == argv, "Original archive call differs", "CONFLICT")
+            if not (directory/'not-started.json').exists():
+                # Only an explicit subsequent archive invocation can continue a
+                # completed ERROR. The public archive API reconciles the same
+                # producer/operation and refuses conflicting or lost identities.
+                # Unknown output/lifetime still requires resume, not redelivery.
+                if args[0] != 'archive' or not (directory/'result.json').exists():
+                    break
+                previous = response_json(retained(directory/'result.json'))
+                if not previous['call_closed'] or previous['reason'] is not None:
+                    break
+                value = response_json(self.calls.read(call_id))
+                if previous['exit_code'] != 1 or value.get('status') != 'ERROR':
+                    break
+            m.require(retry < 100, "Archive continuation budget exhausted", "LIMIT")
             call_id = base_id + '-retry-' + str(retry + 1)
             directory = self.calls.root/call_id
         if directory.exists():
@@ -128,6 +141,15 @@ class ArtifactAdapter:
         m.require(result["exit_code"] == 0 and value.get("status") != "ERROR",
                   "Archive CLI failed; retain the original store and reconcile", "ARCHIVE_ERROR")
         return value
+
+    def _receipt(self, state, result):
+        m.require(result.get("status") == "ARCHIVED"
+                  and result.get("operation_id") == state["attempt"]["operation_id"]
+                  and result.get("producer") == state["binding"]["producer"]
+                  and result.get("content_verified") is True,
+                  "Archive receipt identity or verification differs", "IDENTITY_CONFLICT")
+        m.identity(result.get("artifact_id")); m.identity(result.get("version_id"))
+        return result
 
     @serial
     def archive(self, run_id, evidence):
@@ -149,12 +171,7 @@ class ArtifactAdapter:
         args = ["archive", "--store", self.archive_store, "--producer", state["binding"]["producer"],
                 "--status", str(Path(evidence["directory"])/'status.json'),
                 "--status-sha256", evidence["status_sha256"], "--evidence-dir", evidence["directory"]]
-        result = self._call(args, call_id)
-        m.require(result.get("status") == "ARCHIVED" and result.get("operation_id") == attempt["operation_id"]
-                  and result.get("producer") == state["binding"]["producer"] and result.get("content_verified") is True,
-                  "Archive receipt identity differs", "IDENTITY_CONFLICT")
-        m.identity(result.get("artifact_id")); m.identity(result.get("version_id"))
-        return result
+        return self._receipt(state, self._call(args, call_id))
 
     @serial
     def resume(self, run_id):
@@ -170,9 +187,7 @@ class ArtifactAdapter:
                   "Original archive CLI has no stop proof", "PENDING")
         result = self._call(["resume", "--store", self.archive_store, "--producer", state["binding"]["producer"],
                             "--operation-id", attempt["operation_id"]], "resume-" + str(uuid.uuid4()))
-        m.require(result.get("status") == "ARCHIVED" and result.get("operation_id") == attempt["operation_id"]
-                  and result.get("producer") == state["binding"]["producer"], "Resume receipt identity differs", "IDENTITY_CONFLICT")
-        return result
+        return self._receipt(state, result)
 
     @serial
     def read(self, run_id, *, artifact_id, version_id, output):

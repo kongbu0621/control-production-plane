@@ -52,9 +52,9 @@ def response_json(raw, maximum=512 * 1024):
         raise ControlError("PROTOCOL_ERROR", "Invalid JSON response") from exc
 
 
-def private_directory(path):
+def private_directory(path, *, create=True):
     path = Path(path).absolute()
-    if not path.exists():
+    if create and not path.exists():
         path.mkdir(mode=0o700)
     info = path.lstat()
     require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and not info.st_mode & 0o077,
@@ -85,7 +85,8 @@ def publish(path, raw):
 
 
 def retained(path, maximum=512 * 1024):
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    # A FIFO must be rejected by fstat without blocking on open first.
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, "rb") as stream:
         info = os.fstat(stream.fileno())
         require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid()
@@ -247,7 +248,7 @@ class CliCalls:
     def read(self, call_id, name="stdout"):
         identity(call_id)
         require('/' not in call_id and ':' not in call_id and name in ("stdout", "stderr"), "Invalid call reference")
-        directory = private_directory(self.root / call_id)
+        directory = private_directory(self.root / call_id, create=False)
         result = response_json(retained(directory / "result.json"))
         raw = retained(directory / name, self.max_bytes)
         require(dict(size=len(raw), sha256=sha(raw)) == result["files"][name],
