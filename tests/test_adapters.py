@@ -252,6 +252,31 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(len(self.requests),count)
         self.assertIsNotNone(self.store.get_run('example')['attempt']['prepared_request'])
 
+    def test_saved_status_survives_observe_failure_and_blocks_non_acceptance(self):
+        self.perform('prepare')
+        real = self.respond
+        self.handler = lambda tool, args: None if tool == 'lh_job_submit' else real(tool, args)
+        submit = self.perform('submit')
+        query = self.queue('query')
+        with patch.object(self.adapter, '_observe', side_effect=ControlError('STORAGE_ERROR', 'Synthetic observe commit failure')):
+            with self.assertRaises(ControlError):
+                self.adapter.perform(query)
+        before = self.store.get_run('example'); original = self.store.get_action(submit)
+        self.assertIsNone(before['attempt']['observation'])
+        self.assertEqual(self.store.get_action(query)['response']['observation']['remote_state'], 'RUNNING')
+        raw = self.adapter.calls.read(query); calls = len(self.requests)
+        proof = dict(action_id=submit, operation_id=before['attempt']['operation_id'],
+                     request_digest=before['attempt']['prepared_request']['request_digest'], evidence_ref='demo:contradictory-proof')
+        with self.assertRaises(ControlError):
+            self.store.execute(command('confirm_not_accepted', proof))
+        self.assertEqual(self.store.get_run('example'), before)
+        self.assertEqual(self.store.get_action(submit), original)
+        self.adapter.reconcile(query)
+        self.assertEqual(len(self.requests), calls)
+        self.assertEqual(self.adapter.calls.read(query), raw)
+        self.assertEqual(self.store.get_run('example')['attempt']['observation']['remote_state'], 'RUNNING')
+        self.assertEqual(sum(r['tool'] == 'lh_job_submit' for r in self.requests), 1)
+
     def sealed(self, *, extra_change=False):
         from local_hand_jobs.evidence import EvidenceStore,FrozenSnapshot,QuiescenceProof
         self.perform('prepare');self.perform('submit')

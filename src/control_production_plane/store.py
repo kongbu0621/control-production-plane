@@ -451,7 +451,8 @@ class ControlStore:
         m.natural(body["expected_revision"], high=100)
         m.require(body["expected_revision"] == state["revision"], "Plan revision changed", "CONFLICT")
         observation = state["attempt"]["observation"]
-        revisable = not state["attempt"]["submission_recorded"] or (
+        revisable = (not state["attempt"]["submission_recorded"]
+                     and not state["attempt"].get("maintenance_stop")) or (
             observation and observation["exited"] and (observation["outcome"] == "FAILED" or (observation["outcome"] == "SUCCEEDED"
             and state["attempt"].get("decision", {}).get("decision") == "REJECT")))
         m.require(not state["cancel"] and revisable,
@@ -483,7 +484,8 @@ class ControlStore:
         m.require(count < 3000, "Action record limit reached", "LIMIT")
         kind = body["kind"]
         if kind in ("prepare", "submit"):
-            m.require(not state["cancel"] and not attempt["submission_recorded"], "New submission prohibited", "NOT_READY")
+            m.require(not state["cancel"] and not attempt["submission_recorded"] and not attempt.get("maintenance_stop"),
+                      "New submission prohibited", "NOT_READY")
         if kind == "prepare":
             payload = {"operation_id": attempt["operation_id"], "kind": "workspace.edit",
                        "profile_ref": state["binding"]["profile_ref"], "inputs": m.inputs(state["plan"])}
@@ -513,7 +515,8 @@ class ControlStore:
             m.require(isinstance(lease, _Lease), "Executor lease required", "LEASE_REQUIRED")
             lease.verify(self)
         if kind in ("prepare", "submit"):
-            m.require(not state["cancel"] and not state["attempt"]["submission_recorded"], "New submission prohibited", "NOT_READY")
+            m.require(not state["cancel"] and not state["attempt"]["submission_recorded"]
+                      and not state["attempt"].get("maintenance_stop"), "New submission prohibited", "NOT_READY")
             m.require(time.time() < state["budget"]["deadline_utc"], "New execution deadline expired", "LIMIT")
             m.require(not [a for a in self._pending(db, state["run_id"]) if a["kind"] != "query"], "Original call is not closed", "PENDING")
             for other_id, document in db.execute("SELECT run_id,document FROM runs WHERE run_id!=?", (state["run_id"],)):
@@ -615,6 +618,20 @@ class ControlStore:
 
     @staticmethod
     def _require_no_execution_observed(db, state):
+        m.require(state['attempt'].get('maintenance_stop') is None,
+                  'Maintenance stop proof cannot release the original submission', 'CONFLICT')
+        def compatible(observation):
+            return isinstance(observation, dict) and (
+                observation.get('remote_state') == 'NOT_FOUND' and observation.get('outcome') == 'UNKNOWN'
+                and observation.get('exited') is False and observation.get('evidence_state') in ('UNKNOWN', 'STAGING'))
+        # The adapter records respond and observe in separate transactions. A
+        # crash between them must not hide execution already present in a reply.
+        for (raw,) in db.execute("""SELECT json_extract(document,'$.response') FROM actions
+                WHERE run_id=? AND json_extract(document,'$.attempt_id')=?
+                AND json_type(document,'$.response.observation') IS NOT NULL""",
+                (state['run_id'], state['attempt']['attempt_id'])):
+            m.require(compatible(json.loads(raw)['observation']),
+                      'Retained response conflicts with non-acceptance proof', 'CONFLICT')
         positive = db.execute("""SELECT 1 FROM events WHERE run_id=? AND operation='observe'
             AND json_extract(body,'$.attempt_id')=? AND
             (json_extract(body,'$.remote_state')!='NOT_FOUND'
@@ -623,10 +640,7 @@ class ControlStore:
              OR json_extract(body,'$.evidence_state')='SEALED') LIMIT 1""",
             (state['run_id'], state['attempt']['attempt_id'])).fetchone()
         observation = state['attempt']['observation']
-        compatible = observation is None or (
-            observation['remote_state'] == 'NOT_FOUND' and observation['outcome'] == 'UNKNOWN'
-            and observation['exited'] is False and observation['evidence_state'] != 'SEALED')
-        m.require(compatible and positive is None, 'Remote observation conflicts with non-acceptance proof', 'CONFLICT')
+        m.require((observation is None or compatible(observation)) and positive is None, 'Remote observation conflicts with non-acceptance proof', 'CONFLICT')
 
     def _confirm_not_accepted(self, db, body, lease):
         """Retain a real error response and separately record a trusted proof.

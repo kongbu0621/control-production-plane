@@ -113,11 +113,11 @@ store = initialize("/absolute/private/new-control-store")
 
 `confirm_not_accepted` 的 body 恰含 `action_id`、`operation_id`、`request_digest`、`evidence_ref`。它用于真实提交调用已退出、双流完整且返回错误之后，由受信操作者另行核实原执行端确实未接纳任务的接续。证明必须绑定原部署、主体、任务及请求；错误码、超时或一次 NOT_FOUND 都不能单独成为证明，核心不会自动生成这种结论。当前仅接受已闭合提交的 `{remote_error}` 错误响应，或适配器附有 `call_id` 与 `response_sha256` 的同类响应。
 
-该操作保留原 RESPONDED 动作、错误响应和已消耗调用额度，另附 `non_acceptance` 证明；只释放未被实际接纳的业务尝试预留。原尝试和 operation ID 不变，后续显式排队一个新提交动作，重新核对准备、授权、预算与取消状态。其他调用未闭合、请求错位、曾观察到运行/终态或证据封存时拒绝；证明与额度释放在同一事务中保存。同一证明重放不重复释放，也不清除后来提交；不同证明不能覆盖原证明。这不同于证明进程/传输从未启动的 `not_started`。
+该操作保留原 RESPONDED 动作、错误响应和已消耗调用额度，另附 `non_acceptance` 证明；只释放未被实际接纳的业务尝试预留。原尝试和 operation ID 不变，后续显式排队一个新提交动作，重新核对准备、授权、预算与取消状态。其他调用未闭合、请求错位、曾观察到运行/终态或证据封存时拒绝；已保存响应中的观察同样参与检查，即使进程在 respond 后、observe 落账前退出，或后来又查询到 NOT_FOUND，也不能忽略已返回的执行事实；证明与额度释放在同一事务中保存。同一证明重放不重复释放，也不清除后来提交；不同证明不能覆盖原证明。这不同于证明进程/传输从未启动的 `not_started`。
 
 `confirm_stopped` 用于原执行窗口已结束、公共状态仍有缺口的 `workspace.edit`。body 恰含 `run_id`、`attempt_id`、`operation_id`、`request_digest`、`binding_digest`、`evidence_ref`、`future_start_blocked`、`tree_exited`、`writers_stopped`、`effect_scope`。binding_digest 是本运行 binding 的规范化摘要；三个退出字段必须为 true，effect_scope 必须为 TASK_OWNED_COPY。受信维护者须核实原部署、请求、下发单位和进程树身份，原启动能力已被封锁，全部写入者已停止，副作用仅在原任务独立副本；单个 PID 不存在、控制器退出或错误码本身不足以证明。所有原调用必须已闭合。
 
-证明独立存入 maintenance_stop，不改写远端 observation、UNKNOWN、原任务、调用记录或预算，不生成候选或 ACCEPT。它只允许其他明确创建的运行通过此旧运行的执行占用检查；不会重新开放旧任务的准备/提交或退还业务额度。新运行仍需独立的目标、计划、授权、预算和执行检查。重复相同证明幂等，不同证明拒绝覆盖；recover 返回 REVIEW_STOPPED_RESULT_GAPS，继续提示原结果缺口。本版不据此放行任意外部副作用的未知任务。
+证明独立存入 maintenance_stop，不改写远端 observation、UNKNOWN、原任务、调用记录或预算，不生成候选或 ACCEPT。它只允许其他明确创建的运行通过此旧运行的执行占用检查；不会重新开放旧任务的准备/提交或退还业务额度。新运行仍需独立的目标、计划、授权、预算和执行检查。重复相同证明幂等，不同证明拒绝覆盖；recover 返回 REVIEW_STOPPED_RESULT_GAPS，继续提示原结果缺口。本版不据此放行任意外部副作用的未知任务。 停止证明与释放原业务预留互斥：confirm_not_accepted 和提交的 not_started 不能撤销它。准备、提交的排队/下发及未知结果修订也直接检查停止证明，兼容旧版本已错误释放 submission_recorded 的记录；不会重放旧任务。后来取得明确退出失败或成功但拒绝候选的观察时，仍可按原修订条件保存旧尝试并创建新尝试。
 
 动作从 `QUEUED` 经事务变为 `MAY_HAVE_RUN`，才允许适配器调用。响应保存后为 `RESPONDED`；`call_closed=false` 仍表示调用或采集未闭合。未下发或有明确未启动证明的动作为 `NOT_SENT`。进程在下发边界两侧被杀时，本地记录只证明已知事实，不能从缺响应推断无远端影响。
 
