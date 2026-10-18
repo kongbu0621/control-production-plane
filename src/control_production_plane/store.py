@@ -369,7 +369,8 @@ class ControlStore:
                 next_step = "CONTINUE_UNSENT_PLAN"
             return {"run": state, "next_step": next_step,
                     "pending_calls": [{"action_id": a["action_id"], "kind": a["kind"], "state": a["state"]} for a in pending],
-                    "queued_actions": queued, "external_calls_made": 0}
+                    "queued_actions": queued, "pending_knowledge_calls": [k for k, v in state.get("knowledge_calls", {}).items() if v["state"] == "PENDING"],
+                    "external_calls_made": 0}
 
     def execute(self, request, *, lease=None):
         """Commit a bounded local command; receipts and domain changes are atomic."""
@@ -387,7 +388,8 @@ class ControlStore:
                     "learning_candidate": self._learning, "preflight_failure": self._preflight_failure,
                     "not_started": self._not_started, "candidate": self._candidate,
                     "decide": self._decide, "confirm_not_accepted": self._confirm_not_accepted,
-                    "confirm_stopped": self._confirm_stopped}
+                    "confirm_stopped": self._confirm_stopped,
+                    "knowledge_intent": self._knowledge_intent, "knowledge_ack": self._knowledge_ack}
         m.require(type(operation) is str and operation in handlers, "Unknown operation")
         fingerprint = m.digest(request)
         committing = False
@@ -424,6 +426,16 @@ class ControlStore:
     def _new_attempt(revision):
         return {"attempt_id": str(uuid.uuid4()), "operation_id": str(uuid.uuid4()), "revision": revision,
                 "prepared_request": None, "submission_recorded": False, "observation": None}
+
+    def _knowledge_intent(self, db, body, lease):
+        from .knowledge import record_intent
+        m.require(isinstance(lease, _Lease), "Executor lease required", "LEASE_REQUIRED")
+        lease.verify(self)
+        return record_intent(self, db, body)
+
+    def _knowledge_ack(self, db, body, lease):
+        from .knowledge import record_ack
+        return record_ack(self, db, body)
 
     def _create(self, db, body, lease):
         m.specification(body)
@@ -545,6 +557,9 @@ class ControlStore:
             m.require(time.time() < action["payload"]["expires_at"], "Prepared request expired", "NOT_READY")
             k = state["plan"]["knowledge"]
             m.require(not k["required"] or k["status"] == "SELECTED", "Required knowledge unavailable", "NOT_READY")
+            if k["status"] == "SELECTED":
+                from .knowledge import require_adopted
+                require_adopted(state)
             self._spend(state, "attempts", "max_attempts")
             state["attempt"]["submission_recorded"] = True
         counter, bound = {"query": ("queries", "max_queries"), "cancel": ("cancellations", "max_cancellations")}.get(kind, ("actions", "max_actions"))

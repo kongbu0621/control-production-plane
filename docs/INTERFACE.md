@@ -1,6 +1,6 @@
 # 运行记录核心公共接口
 
-适用版本：`0.1.0a2`，命令 schema 为 `production-plane-v1`，本地存储格式为 `production-plane-store-v1`。包含本地运行记录、静态 CLI 适配、候选及明确的验收决定；存储格式保持兼容，使用新功能后应继续用本版读取。
+适用版本：`0.1.0a3`，命令 schema 为 `production-plane-v1`，本地存储格式为 `production-plane-store-v1`。包含本地运行记录、静态 CLI 适配、候选及明确的验收决定；存储格式保持兼容，使用新功能后应继续用本版读取。
 
 ## 使用边界
 
@@ -68,7 +68,7 @@ store = initialize("/absolute/private/new-control-store")
 `knowledge` 恰含 `required`（布尔值）、`status`、`reason`、`items`：
 
 - `UNCONFIGURED`、`NO_MATCH`、`QUERY_FAILED` 分别表示未配置、没有匹配及查询失败；`items` 必须为空。
-- `SELECTED` 绑定 1–16 项选用知识；每项恰含 `knowledge_id`、`version_id`、`content_sha256`、`admission_ref`、`scope`。
+- `SELECTED` 的记录格式容纳 1–16 项；本版实际采用和提交只支持其中一个准确版本，并要求原 K 使用回执。旧版仅填 `SELECTED` 字符串的计划不能直接提交。每项恰含 `knowledge_id`、`version_id`、`content_sha256`、`admission_ref`、`scope`。
 - `reason` 必填。必需知识不处于 `SELECTED` 时阻止提交；可选知识缺席时保留原因。记录选用信息不等于本核心执行了知识查询或授予准入。
 
 `max_attempts` 为 1–10 次业务提交额度；`max_actions`、`max_queries`、`max_cancellations` 各为 1–1000。准备和提交消耗 actions，提交还预留一个业务额度。查询、取消使用独立额度，业务截止后仍可有界进行。`max_response_bytes` 为 1–262144；核心会检查保存的响应大小，适配器还须在读取响应前限制内存和 I/O。
@@ -160,3 +160,11 @@ store = initialize("/absolute/private/new-control-store")
 库抛出 `ControlError(code, message, commit_state=...)`；主要代码为 `INVALID_INPUT`、`LIMIT`、`CONFLICT`、`NOT_FOUND`、`NOT_READY`、`PENDING`、`BUSY`、`LEASE_REQUIRED`、`IDENTITY_CONFLICT`、`STORE_INVALID`、`STORAGE_ERROR`、`CALL_UNKNOWN`、`CALL_NOT_STARTED`。CLI 成功输出单行 JSON 到 stdout、退出 0；失败输出结构化错误到 stderr、退出 2。输出失败不会撤销已提交记录，仍须按原请求核对。
 
 `perform` 在确认下发意图落账后，若适配器、响应校验或响应持久化抛出 `ControlError`，其属性和 `as_dict()` 额外包含原 `action_id` 与 `dispatch_recorded=true`。`commit_state` 保留报错步骤自身的状态：例如响应未提交或提交结果未知，都不表示此前的下发没有发生。使用原动作读取当前事实，不凭错误重放；`dispatch_recorded` 也不证明业务实际执行成功，未启动证明仍按 `CALL_NOT_STARTED` 和原记录核对。该字段缺失不构成未下发证明，特别是下发事务本身返回 unknown 或进程没有返回时。
+
+## 可选 K 接入
+
+`control_production_plane.knowledge.KnowledgeAdapter` 的 `query`、`selection`、`adopt`、`feedback`、`resume` 通过 K 公共库工作，完整合同见[运行知识适配器](KNOWLEDGE.md)。
+
+新增本地操作 `knowledge_intent`（需执行租约）和 `knowledge_ack`。前者的 body 恰含 `run_id revision knowledge_store_id request notes`，后者恰含 `run_id call_id receipt`；应由适配器构造。它们将原请求、准确尝试和回执存入运行的 `knowledge_calls`，仍与 P 事件和请求回执同事务提交。`recover.pending_knowledge_calls` 列出未确认的 K 调用，不自动发送。调用者仍属于同一受信域，直接写入的回执不是密码学认证。
+
+无需更改原数据库表；旧运行在使用新功能前保持原状。使用新字段后的存储必须继续用 `0.1.0a3` 或兼容后续版本，不能降级到没有采用检查的旧执行器。

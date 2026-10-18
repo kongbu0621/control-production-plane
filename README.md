@@ -4,7 +4,7 @@
 
 它要解决的问题是：**一项任务交给执行器之后，如何持续推进，知道做到了哪一步，处理失败，并拿到能按原目标验收的成果。**
 
-**当前版本：`0.1.0a2` alpha · Linux / Python 3.12 · [MIT 许可](LICENSE)。** 已有运行记录核心、Local Hand 公共 CLI 适配、证据下载、Ledger 归档与指定版本读回，以及明确的验收决定。适配链路已通过合成验证，并在原部署完成一次真实 README 候选的执行、归档、指定版本读回与明确验收；完整故障边界和生产资格仍待验证。当前已实现入口见[开始使用](#开始使用)。
+**当前版本：`0.1.0a3` alpha · Linux / Python 3.12 · [MIT 许可](LICENSE)。** 已有运行记录核心、Local Hand 公共 CLI 适配、证据下载、Ledger 归档与指定版本读回，以及可选 K 知识采用与结果反馈。适配链路已通过合成验证，并在原部署完成一次真实 README 候选的执行、归档、指定版本读回与明确验收；P/K 已完成一次真实知识采用、候选验收与结果回流；组合恢复、其他故障边界和生产资格仍待验证。当前已实现入口见[开始使用](#开始使用)。
 
 ## 它负责什么
 
@@ -22,14 +22,14 @@
 
 <a id="与-local-handledger-的关系"></a>
 
-下表说明组件职责。P 已提供 Local Hand 和 Ledger 的静态适配器；实际可执行范围取决于部署开放的项目与验证。K 仍处于设计阶段。
+下表说明组件职责。P 已提供 Local Hand 和 Ledger 的静态适配器；实际可执行范围取决于部署开放的项目与验证。P 还可经 K 公共库查询知识、登记准确版本的采用，并回流原任务结果。
 
 | 组件 | 主要职责与本仓关系 |
 | --- | --- |
 | **control-production-plane（P）** | 协调目标、计划、执行、验证、修复与接续，关联成果及验收决定 |
 | [infra-local-hand](https://github.com/kongbu0621/infra-local-hand) | 执行后端：P 通过其公共入口准备、提交、查询和取消任务；Local Hand 执行获准任务并返回原状态与封存证据 |
 | [infra-artifact-ledger](https://github.com/kongbu0621/infra-artifact-ledger) | 成果存储：P 经现有 `local-hand-archive` 保存成功封存的候选成果，按准确版本读回供审查；Ledger 保存内容与来源 |
-| [domain-operational-knowledge-core（K）](https://github.com/kongbu0621/domain-operational-knowledge-core) | 可选知识组件（设计中）：拟向 P 提供已准入的准确知识版本，接收有来源的学习候选与使用反馈；知识审查和状态管理留在 K |
+| [domain-operational-knowledge-core（K）](https://github.com/kongbu0621/domain-operational-knowledge-core) | 可选知识组件：提供已准入的准确知识版本；P 登记采用并回流使用反馈，知识审查和状态管理留在 K |
 
 知识接入是可选能力。任务未把知识列为必需输入时，可以独立推进，并记录未配置或降级的原因；任务若明确要求必需知识，未配置、无匹配或查询失败时，应阻止依赖它的新执行。不能伪造知识查询或回流成功。
 
@@ -51,7 +51,7 @@
 - 首个执行适配面向 Local Hand 已登记的 `workspace.edit` 能力；不承诺任意项目、任意命令或任意执行器可用。
 - 修复方案由调用方提供。模型生成方案、多执行器选择、并行调度和图形界面留待真实需要明确后扩展。
 - 控制组件消费执行观察和验收决定；不会把“收到响应”“退出码为零”或“成果已保存”自动等同于目标完成。
-- 首版预留“读取已准入知识”和“回流学习候选”两个可选接口；知识缺席时能否继续，按任务预先确定的可选或必需条件判断。本仓库不实现完整知识系统。
+- 可选知识适配器支持每次尝试采用一个准确版本，保留采用意图、回执及结果反馈；知识缺席时能否继续，按任务预先确定的条件判断。学习候选的自动投递与准入不在本版范围内。
 
 ## 开始使用
 
@@ -61,7 +61,7 @@
 python3.12 -m venv .venv
 .venv/bin/python -m pip install setuptools==84.0.0 wheel==0.48.0
 .venv/bin/python -m pip wheel --no-build-isolation --no-deps . -w dist
-.venv/bin/python -m pip install --no-deps dist/control_production_plane-0.1.0a2-py3-none-any.whl
+.venv/bin/python -m pip install --no-deps dist/control_production_plane-0.1.0a3-py3-none-any.whl
 ```
 
 首次体验可运行[本地记录示例](examples/local_records.py)，使用一个不存在的私有目录：
@@ -89,12 +89,17 @@ python3.12 -m venv .venv
 | `production-plane resume-archive --run-id ID` | 核对旧 CLI 停止后，恢复原任务的归档 |
 | `production-plane read-artifact --run-id ID` | 按准确成果/版本读回，校验实际内容并记录候选 |
 | `write` 的 `candidate` / `decide` 操作 | 保存已核对的候选与逐项验收决定 |
+| `production-plane query-knowledge` / `select-knowledge` | 查询匹配知识或核对指定版本的内容、条件与审查引用 |
+| `production-plane adopt-knowledge` | 按原尝试登记选定版本，取得使用回执后才允许依赖它的提交 |
+| `production-plane knowledge-feedback` / `resume-knowledge` | 保存原任务结果反馈，或沿原请求恢复知识调用 |
 | Python `initialize` / `open_store` | 显式创建或打开控制存储 |
 | Python `ControlStore.perform` | 为受信适配器保留调用意图、互斥和响应；需调用方提供适配器 |
 
 命令均需 `--store DIRECTORY`。已有目录、缺失或损坏的数据库不会被自动初始化覆盖。精确字段、调用闭合责任及错误处理见[公共接口](docs/INTERFACE.md)。
 
 执行和归档适配器需要在独立环境安装所选 Local Hand/Ledger 包，并使用显式的私有配置；配置与操作顺序见[执行、归档与验收](docs/ADAPTERS.md)。本组件按保存的任务方案逐步调用，不自动生成修复方案，也不自动应用补丁或提交 Git。
+
+知识适配器的安装、配置、采用顺序及恢复方法见[接入运行知识](docs/KNOWLEDGE.md)。查询不会登记采用；采用回执也不代表任务已执行，实际结果单独记录。
 
 ## 文档
 

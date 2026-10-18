@@ -1034,8 +1034,8 @@ sys.exit(72)
         prepare = self.queue("prepare", "selected")
         self.store.perform(prepare, spec["binding"], ready)
         submit = self.queue("submit", "selected")
-        self.store.perform(submit, spec["binding"], lambda p: {"response": {"accepted": True}, "call_closed": True})
-        self.assertEqual(self.store.get_run("selected")["counters"]["attempts"], 1)
+        self.error("NOT_READY", self.store.perform, submit, spec["binding"], lambda p: self.fail("Must not dispatch without K receipt"))
+        self.assertEqual(self.store.get_run("selected")["counters"]["attempts"], 0)
 
     def test_late_missing_files_and_read_failure_are_structured(self):
         (self.path / "runs.sqlite").unlink()

@@ -43,6 +43,24 @@ def main(argv=None):
             sub.add_argument("--artifact-id", required=True)
             sub.add_argument("--version-id", required=True)
             sub.add_argument("--output", required=True, type=Path)
+    for name in ("query-knowledge", "select-knowledge", "adopt-knowledge", "knowledge-feedback", "resume-knowledge"):
+        sub = commands.add_parser(name)
+        sub.add_argument("--adapter", required=True, type=Path)
+        if name in ("query-knowledge", "select-knowledge", "adopt-knowledge"):
+            sub.add_argument("--context", required=True, type=Path)
+        if name == "query-knowledge":
+            sub.add_argument("--kind", required=True)
+            sub.add_argument("--after", default="")
+            sub.add_argument("--limit", default=10, type=int)
+        elif name == "select-knowledge":
+            sub.add_argument("--version-id", required=True)
+        else:
+            sub.add_argument("--run-id", required=True)
+        if name == "knowledge-feedback":
+            sub.add_argument("--revision", required=True, type=int)
+            sub.add_argument("--notes", required=True)
+        if name == "resume-knowledge":
+            sub.add_argument("--call-id", required=True)
     args = parser.parse_args(argv)
     mutated = False
     try:
@@ -85,6 +103,23 @@ def main(argv=None):
                 else:
                     data = adapter.read(args.run_id, artifact_id=args.artifact_id, version_id=args.version_id, output=args.output)
                 mutated = True
+            elif args.command in ("query-knowledge", "select-knowledge", "adopt-knowledge", "knowledge-feedback", "resume-knowledge"):
+                from .knowledge import KnowledgeAdapter
+                from .calls import retained
+                adapter = KnowledgeAdapter(store, decode(retained(args.adapter)))
+                if args.command == "query-knowledge":
+                    data = adapter.query(args.kind, decode(retained(args.context)), after=args.after, limit=args.limit)
+                elif args.command == "select-knowledge":
+                    data = adapter.selection(args.version_id, decode(retained(args.context)))
+                elif args.command == "adopt-knowledge":
+                    data = adapter.adopt(args.run_id, decode(retained(args.context)))
+                    mutated = True
+                elif args.command == "knowledge-feedback":
+                    data = adapter.feedback(args.run_id, args.revision, args.notes)
+                    mutated = True
+                else:
+                    data = adapter.resume(args.run_id, args.call_id)
+                    mutated = True
             else:
                 with args.request.open("rb") as stream:
                     request = decode(stream.read(MAX_JSON + 1))

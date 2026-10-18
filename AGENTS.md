@@ -1,10 +1,10 @@
 # 维护与接续
 
-先读 [README](README.md)、[需求](docs/REQUIREMENTS.md)、[架构](docs/ARCHITECTURE.md)和[实施计划](docs/IMPLEMENTATION_PLAN.md)。当前已有 `0.1.0a2` 运行记录核心、库与 CLI，以及 Local Hand/Ledger 静态适配器；合成任务集成验证已完成，原部署的一次真实 README 候选已执行、归档、按指定版本读回并明确 ACCEPT；候选未应用到原工作区。现场已验证 P 响应落账前中断恢复、准备阶段停止推进、业务启动前及真实 helper 运行中取消、完成后取消保留结果。原任务盘经 Owner 批准由 4 GiB 扩至 8 GiB，容量阻塞已解决；运行中取消证明退出，业务结果 UNKNOWN 与证据 STAGING 保留。下一接续按开发记录进入 K 最小实现与组合验证，不能将这些具体窗口概括为完整生产资格。实现字段见 [公共接口](docs/INTERFACE.md)，运行方式见[使用说明](docs/USAGE.md)。当前决定、来源基线和待办见[开发与接续记录](docs/DEVELOPMENT.md)。
+先读 [README](README.md)、[需求](docs/REQUIREMENTS.md)、[架构](docs/ARCHITECTURE.md)和[实施计划](docs/IMPLEMENTATION_PLAN.md)。当前已有 `0.1.0a3` 运行记录核心、库与 CLI，以及 Local Hand/Ledger 静态适配器；合成任务集成验证已完成，原部署的一次真实 README 候选已执行、归档、按指定版本读回并明确 ACCEPT；候选未应用到原工作区。现场已验证 P 响应落账前中断恢复、准备阶段停止推进、业务启动前及真实 helper 运行中取消、完成后取消保留结果。原任务盘经 Owner 批准由 4 GiB 扩至 8 GiB，容量阻塞已解决；运行中取消证明退出，业务结果 UNKNOWN 与证据 STAGING 保留。本版已有 K 公共接口适配及一次真实知识采用、候选验收、结果回流，下一接续按开发记录核对组合恢复边界，不能将这些具体窗口概括为完整生产资格。实现字段见 [公共接口](docs/INTERFACE.md)，运行方式见[使用说明](docs/USAGE.md)。当前决定、来源基线和待办见[开发与接续记录](docs/DEVELOPMENT.md)。
 
 ## 当前方向
 
-本仓是生产方向的控制组件，名字保留 `control-production-plane`。先完成窄范围软件任务的执行、验证、修复、恢复与验收协调，复用 Local Hand 和 Ledger；首版预留知识读取与学习候选回流的可选端口，未配置不冒充空查询成功或回流成功。不能把已有基础组件的成功宣称成本仓已实现或完整系统已验收。
+本仓是生产方向的控制组件，名字保留 `control-production-plane`。先完成窄范围软件任务的执行、验证、修复、恢复与验收协调，复用 Local Hand 和 Ledger；已有可选 K 知识读取、准确版本采用与使用反馈，学习候选自动投递仍待接续，未配置不冒充空查询成功或回流成功。不能把已有基础组件的成功宣称成本仓已实现或完整系统已验收。
 
 README 面向使用者，解释用途、关系、能力和入口；开发历史、阶段过程、接续点放在开发记录。图示应让读者第一眼看出主线与最终用途，辅助存储放在旁侧；修改图时核对实际渲染、文字与有向连线，不为好看改变真实语义。
 
