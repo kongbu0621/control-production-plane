@@ -238,6 +238,109 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.store.get_run(spec["run_id"]), original)
         self.assertEqual(self.store.get_action(refresh)["state"], "QUEUED")
 
+    def test_legacy_ready_cache_does_not_authorize_submit(self):
+        for reply in ("PREPARING", "FAILED"):
+            for boundary in ("queue", "dispatch"):
+                with self.subTest(reply=reply, boundary=boundary):
+                    self.path = self.root / (reply + boundary)
+                    self.store = initialize(self.path)
+                    self.store.execute(command("create", self.spec))
+                    first = self.prepare()
+                    original = self.store.get_run("example")["attempt"]["prepared_request"]
+                    queued = self.queue("submit")
+                    refresh = self.queue("prepare")
+                    self.store.perform(refresh, self.spec["binding"],
+                                       lambda p: {"response": {"state": reply}, "call_closed": True})
+                    # The first release kept this READY cache after a later
+                    # non-ready preparation. Preserve its actual on-disk shape.
+                    legacy = self.store.get_run("example")
+                    legacy["attempt"]["prepared_request"] = original
+                    with sqlite3.connect(self.path / "runs.sqlite") as db:
+                        db.execute("UPDATE runs SET document=? WHERE run_id='example'", (canonical(legacy).decode(),))
+                    self.store = open_store(self.path)
+                    effects = []
+                    def submit(payload):
+                        effects.append(payload)
+                        return {"response": {"accepted": True}, "call_closed": True}
+                    if boundary == "queue":
+                        self.error("NOT_READY", self.queue, "submit")
+                    else:
+                        self.error("NOT_READY", self.store.perform, queued, self.spec["binding"], submit)
+                    self.assertEqual(effects, [])
+                    self.assertEqual(self.store.get_run("example"), legacy)
+                    self.assertEqual(self.store.get_action(first)["response"]["request"], original)
+                    # A fresh READY for the same operation resolves the gap.
+                    self.prepare()
+                    fresh = self.queue("submit")
+                    self.store.perform(fresh, self.spec["binding"], submit)
+                    self.assertEqual(len(effects), 1)
+                    self.assertEqual(effects[0]["operation_id"], original["operation_id"])
+
+    def test_nonstarted_refresh_preserves_ready_and_submission_budget(self):
+        spec = sample("bounded-refresh")
+        spec["budget"]["max_actions"] = 2
+        self.store.execute(command("create", spec))
+        first = self.queue("prepare", spec["run_id"])
+        self.store.perform(first, spec["binding"], ready)
+        original = self.store.get_run(spec["run_id"])["attempt"]["prepared_request"]
+        refresh = self.queue("prepare", spec["run_id"])
+        def cannot_start(payload):
+            raise CallNotStarted("demo:no-process-or-transport-started")
+        self.error("CALL_NOT_STARTED", self.store.perform, refresh, spec["binding"], cannot_start)
+        self.store = open_store(self.path)
+        state = self.store.get_run(spec["run_id"])
+        self.assertEqual(state["attempt"]["prepared_request"], original)
+        self.assertEqual(state["counters"]["actions"], 1)
+        self.assertEqual(self.store.get_action(refresh)["state"], "NOT_SENT")
+        submit = self.queue("submit", spec["run_id"])
+        seen = []
+        def invoke(payload):
+            seen.append(payload)
+            return {"response": {"accepted": True}, "call_closed": True}
+        self.store.perform(submit, spec["binding"], invoke)
+        self.assertEqual(seen, [original])
+        self.assertEqual(self.store.get_run(spec["run_id"])["counters"]["actions"], 2)
+
+    def test_nonstarted_refresh_does_not_restore_superseded_ready(self):
+        first = self.prepare()
+        refresh = self.queue("prepare")
+        self.store.perform(refresh, self.spec["binding"],
+                           lambda p: {"response": {"state": "FAILED"}, "call_closed": True})
+        for _ in range(2):
+            retry = self.queue("prepare")
+            def cannot_start(payload):
+                raise CallNotStarted("demo:local-start-rejected")
+            self.error("CALL_NOT_STARTED", self.store.perform, retry, self.spec["binding"], cannot_start)
+        self.assertIsNone(self.store.get_run("example")["attempt"]["prepared_request"])
+        self.error("NOT_READY", self.queue, "submit")
+        self.assertEqual(self.store.get_action(first)["response"]["state"], "READY")
+
+    def test_preparation_history_uses_dispatch_order_not_queue_order(self):
+        queued_first = self.queue("prepare")
+        queued_second = self.queue("prepare")
+        self.store.perform(queued_second, self.spec["binding"],
+                           lambda p: {"response": {"state": "FAILED"}, "call_closed": True})
+        self.store.perform(queued_first, self.spec["binding"], ready)
+        submit = self.queue("submit")
+        self.store.perform(submit, self.spec["binding"],
+                           lambda p: {"response": {"accepted": True}, "call_closed": True})
+        self.assertEqual(self.store.get_run("example")["counters"]["attempts"], 1)
+
+    def test_no_start_proof_cannot_restore_ready_from_prior_attempt(self):
+        first = self.prepare()
+        old_attempt = self.store.get_run("example")["attempt"]
+        self.store.execute(command("revise", {"run_id": "example", "expected_revision": 1,
+                                            "plan": dict(self.spec["plan"], content="print('revised')\n")}))
+        action = self.queue("prepare")
+        def cannot_start(payload):
+            raise CallNotStarted("demo:new-attempt-did-not-start")
+        self.error("CALL_NOT_STARTED", self.store.perform, action, self.spec["binding"], cannot_start)
+        current = self.store.get_run("example")["attempt"]
+        self.assertNotEqual(current["operation_id"], old_attempt["operation_id"])
+        self.assertIsNone(current["prepared_request"])
+        self.error("NOT_READY", self.queue, "submit")
+        self.assertEqual(self.store.get_action(first)["response"]["request"], old_attempt["prepared_request"])
+
     def test_refresh_process_exit_preserves_old_ready_only_as_history(self):
         first = self.prepare()
         queued = self.queue("submit")

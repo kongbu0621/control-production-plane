@@ -193,6 +193,40 @@ class ControlStore:
                 result.append(action)
         return result
 
+    @staticmethod
+    def _prepared_from_history(db, state):
+        """Read the latest effective preparation in dispatch order, not queue order.
+
+        Legacy stores can retain a READY cache after a later non-ready response.
+        Only proved non-starts may be skipped; unknown calls remain barriers.
+        """
+        rows = db.execute("""SELECT a.document FROM events e JOIN actions a
+            ON a.action_id=json_extract(e.body,'$.action_id')
+            WHERE e.run_id=? AND e.operation='dispatch' AND a.run_id=e.run_id
+            AND json_extract(a.document,'$.attempt_id')=?
+            AND json_extract(a.document,'$.kind')='prepare' ORDER BY e.seq DESC""",
+            (state["run_id"], state["attempt"]["attempt_id"]))
+        for row in rows:
+            action = m.decode(row[0].encode("ascii"))
+            response = action["response"]
+            if (action["state"] == "NOT_SENT" and action["call_closed"]
+                    and isinstance(response, dict) and response.get("local_failure") == "CALL_NOT_STARTED"):
+                m.identity(response.get("evidence_ref"))
+                continue
+            if action["state"] == "RESPONDED" and response.get("state") == "READY":
+                request = response.get("request")
+                m.prepared(request, state)
+                return request
+            return None
+        return None
+
+    def _current_prepared(self, db, state):
+        request = state["attempt"]["prepared_request"]
+        m.require(request is not None, "No prepared request", "NOT_READY")
+        m.require(self._prepared_from_history(db, state) == request,
+                  "Prepared request is not backed by current preparation history", "NOT_READY")
+        return request
+
     @contextmanager
     def _reading(self):
         try:
@@ -419,8 +453,7 @@ class ControlStore:
             payload = {"operation_id": attempt["operation_id"], "kind": "workspace.edit",
                        "profile_ref": state["binding"]["profile_ref"], "inputs": m.inputs(state["plan"])}
         elif kind == "submit":
-            m.require(attempt["prepared_request"] is not None, "No prepared request", "NOT_READY")
-            payload = attempt["prepared_request"]
+            payload = self._current_prepared(db, state)
         elif kind == "cancel":
             m.require(state["cancel"] and attempt["submission_recorded"], "Cancellation requires a submitted attempt and local intent", "NOT_READY")
             payload = {"operation_id": attempt["operation_id"], "expected_request_digest": attempt["prepared_request"]["request_digest"], "target": {"kind": "job"}}
@@ -467,6 +500,7 @@ class ControlStore:
             m.require(action["payload"] == expected, "Cancellation no longer matches original submission", "CONFLICT")
         if kind == "submit":
             m.require(action["payload"] == state["attempt"]["prepared_request"], "Prepared revision changed", "CONFLICT")
+            self._current_prepared(db, state)
             m.require(time.time() < action["payload"]["expires_at"], "Prepared request expired", "NOT_READY")
             k = state["plan"]["knowledge"]
             m.require(not k["required"] or k["status"] == "SELECTED", "Required knowledge unavailable", "NOT_READY")
@@ -542,6 +576,8 @@ class ControlStore:
         state["counters"][counter] -= 1
         action.update(state="NOT_SENT", call_closed=True, response={"local_failure": "CALL_NOT_STARTED", "evidence_ref": body["evidence_ref"]})
         self._save_action(db, action)
+        if action["kind"] == "prepare":
+            state["attempt"]["prepared_request"] = self._prepared_from_history(db, state)
         self._save(db, state)
         return {"run_id": action["run_id"], "action_id": action["action_id"], "state": "NOT_SENT"}
 
