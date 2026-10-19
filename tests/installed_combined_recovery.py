@@ -79,6 +79,34 @@ def expect_error(code, function):
     raise RuntimeError(f'Expected {code}, operation unexpectedly succeeded')
 
 
+def retain_child(child, root, name, output, *, prefix=b''):
+    """Reap only this exercise's own child and preserve its actual byte streams."""
+    if child.poll() is None:
+        child.kill()
+    if output is None:
+        output = child.communicate(timeout=10)
+    stdout, stderr = output
+    save(root / (name + '-child.json'), dict(exit_code=child.returncode,
+         stdout_hex=(bytes(prefix) + stdout).hex(), stderr_hex=stderr.hex()))
+
+
+def writer_ready(child, received, *, timeout):
+    # A readable pipe can contain only part of a line. Never follow select()
+    # with an unbounded readline(); every byte shares this monotonic deadline.
+    marker = b'held\n'
+    deadline = time.monotonic() + timeout
+    with selectors.DefaultSelector() as selector:
+        selector.register(child.stdout, selectors.EVENT_READ)
+        while len(received) < len(marker):
+            remaining = deadline - time.monotonic()
+            require(remaining > 0 and selector.select(remaining), 'Original writer readiness timed out')
+            chunk = os.read(child.stdout.fileno(), len(marker) - len(received))
+            require(chunk, 'Original writer exited before readiness')
+            received.extend(chunk)
+            require(marker.startswith(received), 'Original writer returned an invalid readiness marker')
+    require(child.poll() is None, 'Original writer exited before holding its lease')
+
+
 class Fixture:
     """One private synthetic data domain; only this harness creates writers."""
     def __init__(self, root, ledger_commit):
@@ -170,7 +198,7 @@ class Fixture:
         return self.queue('submit')
 
 
-def lost_adoption_reply(f):
+def lost_adoption_reply(f, *, child_timeout=30):
     config = f.root / 'adapter.json'; save(config, f.config)
     # A real child exits after K commits and before P acknowledges that receipt.
     code = '''
@@ -184,9 +212,14 @@ def stop(request, **kwargs):
 p.execute = stop
 KnowledgeAdapter(p, json.load(open(sys.argv[2]))).adopt('example', {'project':'example'})
 '''
-    child = subprocess.run([sys.executable, '-I', '-B', '-c', code, str(f.p.root), str(config)],
-                           capture_output=True, timeout=30)
-    require(child.returncode == 23 and not child.stdout and not child.stderr, 'Child did not stop at the acknowledgement gap')
+    child = subprocess.Popen([sys.executable, '-I', '-B', '-c', code, str(f.p.root), str(config)],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    output = None
+    try:
+        output = child.communicate(timeout=child_timeout)
+        require(child.returncode == 23 and output == (b'', b''), 'Child did not stop at the acknowledgement gap')
+    finally:
+        retain_child(child, f.root, 'adoption', output)
     state = f.p.get_run('example'); cid = state['attempt']['knowledge_use']
     call = state['knowledge_calls'][cid]
     require(call['state'] == 'PENDING', 'P did not retain the original pending call')
@@ -213,7 +246,7 @@ KnowledgeAdapter(p, json.load(open(sys.argv[2]))).adopt('example', {'project':'e
             'Receipt recovery wrote K or Ledger')
     require(hashes(f.root / 'original-p') == original_p and hashes(f.root / 'original-k') == original_k,
             'Recovery changed original P/K files')
-    return dict(result='ORIGINAL_RECEIPT_RECOVERED', child_exit=23, business_submissions=0,
+    return dict(result='ORIGINAL_RECEIPT_RECOVERED', child_exit=child.returncode, business_submissions=0,
                 k_files_unchanged=True, ledger_files_unchanged=True, repeated_recovery_unchanged=True)
 
 
@@ -306,7 +339,7 @@ def unknown_submission(f):
     return dict(result='UNKNOWN_SUBMISSION_RETAINED', synthetic_effects=1, recovery_effects=0)
 
 
-def original_writer(f):
+def original_writer(f, *, ready_timeout=10):
     # Deliberately demonstrate that locks in two cold copies are independent.
     # Copy BEFORE starting the writer: never take an online P/K file copy.
     p, _, _ = f.clone()
@@ -319,11 +352,9 @@ with open_store(sys.argv[1]).executor():
 '''
     child = subprocess.Popen([sys.executable, '-I', '-B', '-c', code, str(f.p.root)],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    received, output = bytearray(), None
     try:
-        with selectors.DefaultSelector() as selector:
-            selector.register(child.stdout, selectors.EVENT_READ)
-            require(bool(selector.select(10)), 'Original writer did not become ready')
-        require(child.stdout.readline() == b'held\n' and child.poll() is None, 'Original writer did not hold its lease')
+        writer_ready(child, received, timeout=ready_timeout)
         def original_lock():
             with f.p.executor():
                 raise RuntimeError('Original writer lock was bypassed')
@@ -333,11 +364,11 @@ with open_store(sys.argv[1]).executor():
             # Getting the copy's lock does NOT establish source writer exit.
             original_alive = child.poll() is None
         require(original_alive, 'Original writer exited before the copy lock check')
-        out, err = child.communicate(b'x', timeout=10)
+        output = child.communicate(b'x', timeout=10)
+        out, err = output
         require(child.returncode == 0 and not out and not err, 'Original writer exit/streams not confirmed')
     finally:
-        if child.poll() is None:
-            child.kill(); child.communicate(timeout=10)
+        retain_child(child, f.root, 'writer', output, prefix=received)
     require(p.get_run('example')['counters']['attempts'] == 0, 'Writer probe submitted a task')
     return dict(result='COPY_LOCK_IS_NOT_WRITER_FENCING', original_lock_busy=True,
                 copy_lock_acquired_while_original_alive=original_alive,

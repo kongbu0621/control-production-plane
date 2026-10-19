@@ -5,12 +5,14 @@ installed packages. The exercise must reject them. Retain all fixtures/reports;
 this runner's zero exit means its rejection assertions passed, not activation.
 """
 import argparse
+from contextlib import contextmanager
 import importlib.util
 import json
 from pathlib import Path
 import re
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 import uuid
@@ -19,6 +21,74 @@ import uuid
 class RejectionTests(unittest.TestCase):
     def fixture(self):
         return self.exercise.Fixture(self.root / self._testMethodName, self.ledger_commit)
+
+    @contextmanager
+    def child_probe(self, code):
+        h = self.exercise
+        popen, children = h.subprocess.Popen, []
+        def start(argv, **kwargs):
+            child = popen([sys.executable, '-I', '-B', '-c', code], **kwargs)
+            children.append(child)
+            return child
+        try:
+            with patch.object(h.subprocess, 'Popen', start):
+                yield children
+        finally:
+            # A regression must not leave this test's synthetic child behind.
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                child.communicate(timeout=3)
+
+    def assert_child_record(self, fixture, children, name, stdout, stderr, exit_code):
+        self.assertEqual(len(children), 1)
+        child, = children
+        self.assertEqual(child.poll(), exit_code)
+        self.assertTrue(child.stdout.closed and child.stderr.closed)
+        saved = json.loads((fixture.root / (name + '-child.json')).read_bytes())
+        self.assertEqual(saved['exit_code'], exit_code)
+        self.assertEqual(bytes.fromhex(saved['stdout_hex']), stdout)
+        self.assertEqual(bytes.fromhex(saved['stderr_hex']), stderr)
+
+    def test_partial_writer_ready_times_out_and_retains_output(self):
+        h = self.exercise
+        fixture = self.fixture()
+        code = "import os,time; os.write(1,b'he'); time.sleep(5)"
+        with self.child_probe(code) as children:
+            started = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, 'readiness timed out'):
+                h.original_writer(fixture, ready_timeout=0.5)
+            self.assertLess(time.monotonic() - started, 3)
+            self.assert_child_record(fixture, children, 'writer', b'he', b'', -9)
+
+    def test_writer_startup_failure_retains_stderr(self):
+        h = self.exercise
+        fixture = self.fixture()
+        code = "import os; os.write(2,b'synthetic startup failure\\n'); raise SystemExit(7)"
+        with self.child_probe(code) as children:
+            with self.assertRaisesRegex(RuntimeError, 'exited before readiness'):
+                h.original_writer(fixture)
+            self.assert_child_record(fixture, children, 'writer', b'', b'synthetic startup failure\n', 7)
+
+    def test_adoption_startup_failure_retains_stderr(self):
+        h = self.exercise
+        fixture = self.fixture()
+        code = "import os; os.write(2,b'synthetic adoption failure\\n'); raise SystemExit(7)"
+        with self.child_probe(code) as children:
+            with self.assertRaisesRegex(RuntimeError, 'acknowledgement gap'):
+                h.lost_adoption_reply(fixture)
+            self.assert_child_record(fixture, children, 'adoption', b'', b'synthetic adoption failure\n', 7)
+
+    def test_adoption_timeout_reaps_child_and_retains_partial_output(self):
+        h = self.exercise
+        fixture = self.fixture()
+        code = "import os,time; os.write(1,b'partial stdout'); os.write(2,b'partial stderr'); time.sleep(5)"
+        with self.child_probe(code) as children:
+            started = time.monotonic()
+            with self.assertRaises(h.subprocess.TimeoutExpired):
+                h.lost_adoption_reply(fixture, child_timeout=0.5)
+            self.assertLess(time.monotonic() - started, 3)
+            self.assert_child_record(fixture, children, 'adoption', b'partial stdout', b'partial stderr', -9)
 
     def test_wrong_failure_event_is_rejected(self):
         h = self.exercise
