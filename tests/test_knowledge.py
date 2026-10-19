@@ -58,7 +58,7 @@ class KnowledgeTests(unittest.TestCase):
 
     def submit(self):
         self.p.perform(self.queue('prepare'),self.spec['binding'],ready)
-        self.p.perform(self.queue('submit'),self.spec['binding'],lambda _:dict(response=dict(accepted=True),call_closed=True))
+        self.p.perform(self.queue('submit'),self.spec['binding'],lambda _:dict(response=dict(accepted=True),call_closed=True),knowledge=self.a)
 
     def test_query_selection_adoption_submission_feedback_reopen(self):
         self.assertFalse(self.a.query('guidance',self.context)['usage_recorded'])
@@ -84,7 +84,8 @@ class KnowledgeTests(unittest.TestCase):
         self.op('retire',dict(expected_version_id=self.version,reviewer='example:reviewer',reason='No new uses',evidence_material_ids=['material:example']))
         self.a.adopt('example',self.context)
         self.assertEqual(len(self.p.get_run('example')['knowledge_calls']),1)
-        self.submit()
+        with self.assertRaises(ControlError):self.submit()
+        self.assertFalse(self.p.get_run('example')['attempt']['submission_recorded'])
 
     def test_query_then_retirement_rejects_new_use_without_spending(self):
         self.op('retire',dict(expected_version_id=self.version,reviewer='example:reviewer',reason='No new uses',evidence_material_ids=['material:example']))

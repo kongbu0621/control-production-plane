@@ -53,6 +53,27 @@ def require_adopted(state):
     return call
 
 
+class _ExecutionCheck:
+    """One in-process dispatch observation, never a reusable persisted grant."""
+    def __init__(self, store, action_id, state, observation):
+        self.store, self.action_id = store, action_id
+        self.binding = self._binding(state)
+        self.observation = json.loads(m.canonical(observation))
+        self.used = False
+
+    @staticmethod
+    def _binding(state):
+        return m.digest([state['run_id'], state['revision'], state['attempt']['attempt_id'],
+                         state['attempt']['operation_id'], state['plan'], require_adopted(state)])
+
+    def consume(self, store, action_id, state):
+        m.require(not self.used and self.store is store and self.action_id == action_id
+                  and self.binding == self._binding(state),
+                  "Execution knowledge check differs from this dispatch", "CONFLICT")
+        self.used = True
+        return self.observation
+
+
 def historical(store, db, state, revision):
     if revision == state["revision"]:
         return state
@@ -240,12 +261,59 @@ class KnowledgeAdapter:
     def selection(self, version_id, context):
         context = context_value(context)
         value = self._open().get("version", version_id)
+        return self._selection(value, context)
+
+    @staticmethod
+    def _selection(value, context):
         v = value["record"]
         m.require(v["state"] == "ACTIVE" and all(context.get(k) == x for k, x in v["conditions"].items())
                   and all(x["status"] == "VERIFIED" for x in value["materials"]), "Knowledge unavailable for new adoption", "NOT_READY")
         item = dict(knowledge_id=v["lineage_id"], version_id=v["version_id"], content_sha256=hashlib.sha256(v["content"].encode()).hexdigest(),
                     admission_ref=v["review_id"], scope=condition_scope(v["conditions"]))
         return dict(item=item, content=v["content"], conditions=v["conditions"])
+
+    def check_execution(self, state):
+        """Read today's original receipt, usage, exact version and material bytes.
+
+        This observation is not an execution grant or a cross-store lock.
+        perform() obtains it afresh after executor preflight for each submit.
+        """
+        call = require_adopted(state)
+        req = call['request']
+        m.require(call['knowledge_store_id'] == self.config['store_id']
+                  and req['scope'] == self.config['scope'],
+                  "Execution must check the original K destination", "IDENTITY_CONFLICT")
+        try:
+            from domain_operational_knowledge_core import KnowledgeError
+        except ImportError as exc:
+            raise m.ControlError('DEPENDENCY_MISSING', 'Install the configured public K package') from exc
+        try:
+            k = self._open()
+            result = k.get_operation(req['scope'], req['operation'], req['request_id'])
+            m.require(result['receipt'] == call['receipt'],
+                      "Original K adoption receipt is missing or changed", "IDENTITY_CONFLICT")
+            observed = result['observation']
+            m.require(observed['record_status'] == 'AVAILABLE',
+                      "Original K usage cannot currently be verified", "KNOWLEDGE_UNAVAILABLE")
+            usage = observed['record']
+            m.require(all(usage.get(name) == value for name, value in req['body'].items())
+                      and usage['scope'] == req['scope'],
+                      "K usage differs from the original attempt", "IDENTITY_CONFLICT")
+            value = k.get('version', req['body']['version_id'])
+            m.require(all(item['status'] == 'VERIFIED' for item in value['materials']),
+                      'Knowledge material bytes cannot currently be verified', 'KNOWLEDGE_UNAVAILABLE')
+            selection = self._selection(value, context_value(req['body']['context']))
+            m.require(selection['item'] == state['plan']['knowledge']['items'][0],
+                      "Knowledge differs from the original plan", "IDENTITY_CONFLICT")
+        except (KnowledgeError, OSError) as exc:
+            raise m.ControlError('KNOWLEDGE_UNAVAILABLE',
+                                 'Current K state could not be read; retain the queued action') from exc
+        return dict(schema='execution-knowledge-check-v1', knowledge_store_id=call['knowledge_store_id'],
+                    call_id=call['call_id'], scope=req['scope'], usage_id=req['body']['usage_id'],
+                    receipt_sha256=m.digest(call['receipt']), item=selection['item'],
+                    context_sha256=hashlib.sha256(encoded(req['body']['context'])).hexdigest(),
+                    state=value['record']['state'], observed_at=value['observed_at'],
+                    materials=value['materials'])
 
     def _command(self, op, body, suffix):
         return dict(schema="production-plane-v1", request_id="pk:" + m.digest([op, body, suffix]), operation=op, body=body)

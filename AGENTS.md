@@ -1,6 +1,6 @@
 # 维护与接续
 
-先读 [README](README.md)、[需求](docs/REQUIREMENTS.md)、[架构](docs/ARCHITECTURE.md)和[实施计划](docs/IMPLEMENTATION_PLAN.md)。当前已有 `0.1.0a3` 运行记录核心、库与 CLI，以及 Local Hand/Ledger 静态适配器；合成任务集成验证已完成，原部署的一次真实 README 候选已执行、归档、按指定版本读回并明确 ACCEPT；候选未应用到原工作区。现场已验证 P 响应落账前中断恢复、准备阶段停止推进、业务启动前及真实 helper 运行中取消、完成后取消保留结果。原任务盘经 Owner 批准由 4 GiB 扩至 8 GiB，容量阻塞已解决；运行中取消证明退出，业务结果 UNKNOWN 与证据 STAGING 保留。本版已有 K 公共接口适配及一次真实知识采用、候选验收、结果回流，下一接续按开发记录核对组合恢复边界，不能将这些具体窗口概括为完整生产资格。实现字段见 [公共接口](docs/INTERFACE.md)，运行方式见[使用说明](docs/USAGE.md)。当前决定、来源基线和待办见[开发与接续记录](docs/DEVELOPMENT.md)。
+先读 [README](README.md)、[需求](docs/REQUIREMENTS.md)、[架构](docs/ARCHITECTURE.md)和[实施计划](docs/IMPLEMENTATION_PLAN.md)。当前已有 `0.1.0a4` 运行记录核心、库与 CLI，以及 Local Hand/Ledger 静态适配器；合成任务集成验证已完成，原部署的一次真实 README 候选已执行、归档、按指定版本读回并明确 ACCEPT；候选未应用到原工作区。现场已验证 P 响应落账前中断恢复、准备阶段停止推进、业务启动前及真实 helper 运行中取消、完成后取消保留结果。原任务盘经 Owner 批准由 4 GiB 扩至 8 GiB，容量阻塞已解决；运行中取消证明退出，业务结果 UNKNOWN 与证据 STAGING 保留。本版已有 K 公共接口适配及一次真实知识采用、候选验收、结果回流，本版增加新提交前的当前知识核对，下一接续按开发记录核对组合恢复边界，不能将这些具体窗口概括为完整生产资格。实现字段见 [公共接口](docs/INTERFACE.md)，运行方式见[使用说明](docs/USAGE.md)。当前决定、来源基线和待办见[开发与接续记录](docs/DEVELOPMENT.md)。
 
 ## 当前方向
 

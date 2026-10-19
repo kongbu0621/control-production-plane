@@ -187,7 +187,7 @@ class LocalHandAdapter:
                 evidence_ref="cli:" + result["call_id"])
         return summary
 
-    def perform(self, action_id):
+    def perform(self, action_id, *, knowledge=None):
         action = self.store.get_action(action_id)
         state = self.store.get_run(action["run_id"])
         def preflight(_):
@@ -196,7 +196,7 @@ class LocalHandAdapter:
             value, result, digest = self._tool(TOOLS[action["kind"]], payload, call_id=action_id)
             return dict(response=self._summary(action, value, result, digest), call_closed=result["call_closed"])
         try:
-            receipt = self.store.perform(action_id, self.config["binding"], invoke, preflight=preflight)
+            receipt = self.store.perform(action_id, self.config["binding"], invoke, preflight=preflight, knowledge=knowledge)
         except m.ControlError:
             # Only a completed local CLI record proves both exit and pipe EOF.
             path = self.calls.root / action_id / "result.json"

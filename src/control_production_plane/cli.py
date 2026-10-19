@@ -32,6 +32,8 @@ def main(argv=None):
             sub.add_argument("--action-id", required=True)
         if name == "collect-evidence":
             sub.add_argument("--output", required=True, type=Path)
+        if name == "execute-action":
+            sub.add_argument("--knowledge-adapter", type=Path)
     for name in ("archive-result", "resume-archive", "read-artifact"):
         sub = commands.add_parser(name)
         sub.add_argument("--adapter", required=True, type=Path)
@@ -83,7 +85,15 @@ def main(argv=None):
                 if args.command == "inspect-executor":
                     data = adapter.capabilities()
                 elif args.command == "execute-action":
-                    data = adapter.perform(args.action_id)
+                    knowledge = None
+                    # Read recovery and cancellation remain available without K.
+                    action = store.get_action(args.action_id)
+                    if (action['kind'] == 'submit'
+                            and store.get_run(action['run_id'])['plan']['knowledge']['status'] == 'SELECTED'
+                            and args.knowledge_adapter is not None):
+                        from .knowledge import KnowledgeAdapter
+                        knowledge = KnowledgeAdapter(store, decode(retained(args.knowledge_adapter)))
+                    data = adapter.perform(args.action_id, knowledge=knowledge)
                 elif args.command == "reconcile-action":
                     data = adapter.reconcile(args.action_id)
                 else:

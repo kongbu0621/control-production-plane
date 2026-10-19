@@ -1,6 +1,6 @@
 # 运行记录核心公共接口
 
-适用版本：`0.1.0a3`，命令 schema 为 `production-plane-v1`，本地存储格式为 `production-plane-store-v1`。包含本地运行记录、静态 CLI 适配、候选及明确的验收决定；存储格式保持兼容，使用新功能后应继续用本版读取。
+适用版本：`0.1.0a4`，命令 schema 为 `production-plane-v1`，本地存储格式为 `production-plane-store-v1`。包含本地运行记录、静态 CLI 适配、候选及明确的验收决定；存储格式保持兼容，使用新功能后应继续用本版读取。
 
 ## 使用边界
 
@@ -31,7 +31,7 @@ store = initialize("/absolute/private/new-control-store")
 | `store.events(run_id, *, after=0, limit=10)` | 按全库事件序号分页；每页最多 10 条，下一页用上一页最后一个序号 |
 | `store.recover(run_id)` | 一致读取运行、未闭合调用、待发动作和接续建议；不发出外部调用 |
 | `store.executor()` | 上下文管理器，取得本控制存储的执行互斥；不持有长期 SQLite 写事务 |
-| `store.perform(action_id, observed_binding, invoke, *, preflight=None)` | 持久记录下发边界后调用受信适配器一次，再记录响应；不自动重发 |
+| `store.perform(action_id, observed_binding, invoke, *, preflight=None, knowledge=None)` | 持久记录下发边界后调用受信适配器一次，再记录响应；不自动重发 |
 
 返回的数据是独立值；修改返回对象不改变存储。一个实例可重新打开为多个 handle；多个进程的本地变更由短事务串行化。准备和提交需执行互斥；查询、取消意图与原任务取消调用不等待执行互斥。
 
@@ -169,4 +169,10 @@ store = initialize("/absolute/private/new-control-store")
 
 新 pending 调用包含 `receipt_capacity_version=1`，表示已在运行记录中预留成功回执和取消记录容量；确认后移除此字段。旧记录可以没有该字段，恢复按[知识接入边界](KNOWLEDGE.md#中断与边界)处理。`knowledge_ack` 校验 K 公共回执的精确结果字段、布尔 `reused` 和非负安全整数时间戳；额外结果字段不被默认为受支持。容量检查中的占位值仅在内存计算，不是持久证据或实际发生的取消。
 
-无需更改原数据库表；旧运行在使用新功能前保持原状。使用新字段后的存储必须继续用 `0.1.0a3` 或兼容后续版本，不能降级到没有采用检查的旧执行器。
+无需更改原数据库表；旧运行在使用新功能前保持原状。使用新字段后的存储必须继续用 `0.1.0a4` 或兼容后续版本，不能降级到没有采用检查的旧执行器。
+
+### 新提交的知识检查
+
+`0.1.0a4` 的 `store.perform` 与 `LocalHandAdapter.perform` 接受可选 `knowledge=KnowledgeAdapter(store, config)`。SELECTED 任务的新 submit 必须提供绑定当前 P 句柄的适配器，并取得新的当前状态检查；直接 JSON dispatch 无法代替该调用。普通未选知识任务、query 和 cancel 的原调用方式兼容。
+
+`execute-action` 增加 `--knowledge-adapter FILE`，文件格式与已有知识命令的 `--adapter` 相同。`action.knowledge_check` 是随当次 dispatch 保存的历史观察，不能重放为许可。检查失败保留 QUEUED 和 `preflight_failure`，不花业务额度；已经 MAY_HAVE_RUN 的动作不重新提交。详细窗口和错误语义见[知识接入](KNOWLEDGE.md)。旧安装没有该检查，执行这类任务的进程应统一升级；本版没有改写旧账本或强制迁移数据库。

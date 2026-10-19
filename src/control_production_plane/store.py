@@ -290,7 +290,7 @@ class ControlStore:
             m.require(row is not None, "Candidate not found", "NOT_FOUND")
             return m.decode(row[0].encode("ascii"))
 
-    def perform(self, action_id, observed_binding, invoke, *, preflight=None):
+    def perform(self, action_id, observed_binding, invoke, *, preflight=None, knowledge=None):
         """Call a trusted adapter once, after durable dispatch; never auto-redeliver.
 
         invoke(payload) returns {response: object, call_closed: bool}. The adapter
@@ -299,22 +299,31 @@ class ControlStore:
         """
         action = self.get_action(action_id)
         if action["kind"] in ("query", "cancel"):
-            return self._perform(action_id, observed_binding, invoke, preflight, None)
+            return self._perform(action_id, observed_binding, invoke, preflight, None, knowledge)
         with self.executor() as lease:
-            return self._perform(action_id, observed_binding, invoke, preflight, lease)
+            return self._perform(action_id, observed_binding, invoke, preflight, lease, knowledge)
 
-    def _perform(self, action_id, observed_binding, invoke, preflight, lease):
+    def _perform(self, action_id, observed_binding, invoke, preflight, lease, knowledge):
         action = self.get_action(action_id)
         m.require(action["state"] == "QUEUED", "Original action already passed the dispatch boundary", "PENDING")
-        if preflight is not None:
-            try:
+        check = None
+        try:
+            if preflight is not None:
                 preflight(json.loads(m.canonical(action["payload"])))
-            except ControlError as exc:
-                self.execute({"schema": "production-plane-v1", "request_id": str(uuid.uuid4()),
-                              "operation": "preflight_failure", "body": {"action_id": action_id, "code": exc.code}})
-                raise
+            if action['kind'] == 'submit':
+                state = self.get_run(action['run_id'])
+                if state['plan']['knowledge']['status'] == 'SELECTED':
+                    from .knowledge import KnowledgeAdapter, _ExecutionCheck
+                    m.require(isinstance(knowledge, KnowledgeAdapter) and knowledge.store is self,
+                              'Selected knowledge requires a configured current K check', 'NOT_READY')
+                    check = _ExecutionCheck(self, action_id, state, knowledge.check_execution(state))
+        except ControlError as exc:
+            self.execute({"schema": "production-plane-v1", "request_id": str(uuid.uuid4()),
+                          "operation": "preflight_failure", "body": {"action_id": action_id, "code": exc.code}})
+            raise
         receipt = self.execute({"schema": "production-plane-v1", "request_id": "dispatch:" + action_id,
-                                "operation": "dispatch", "body": {"action_id": action_id, "observed_binding": observed_binding}}, lease=lease)
+                                "operation": "dispatch", "body": {"action_id": action_id, "observed_binding": observed_binding}},
+                               lease=lease, _knowledge_check=check)
         m.require(not receipt["replayed"], "Dispatch receipt is historical, not permission to invoke", "PENDING")
         try:
             try:
@@ -374,7 +383,7 @@ class ControlStore:
                     "queued_actions": queued, "pending_knowledge_calls": [k for k, v in state.get("knowledge_calls", {}).items() if v["state"] == "PENDING"],
                     "external_calls_made": 0}
 
-    def execute(self, request, *, lease=None):
+    def execute(self, request, *, lease=None, _knowledge_check=None):
         """Commit a bounded local command; receipts and domain changes are atomic."""
         if type(request) is bytes:
             request = m.decode(request)
@@ -405,7 +414,8 @@ class ControlStore:
                     return {"replayed": True, "receipt": json.loads(old[1])}
                 size = db.execute("PRAGMA page_count").fetchone()[0] * db.execute("PRAGMA page_size").fetchone()[0]
                 m.require(size + 8 * m.MAX_JSON <= m.MAX_STORE, "Control store limit reached", "LIMIT")
-                result = handlers[operation](db, request["body"], lease)
+                result = (self._dispatch(db, request['body'], lease, _knowledge_check) if operation == 'dispatch'
+                          else handlers[operation](db, request["body"], lease))
                 run_id = result["run_id"]
                 now = int(time.time())
                 seq = db.execute("INSERT INTO events(run_id,operation,body,recorded_at) VALUES (?,?,?,?)",
@@ -516,7 +526,7 @@ class ControlStore:
         db.execute("INSERT INTO actions VALUES (?,?,?)", (body["action_id"], body["run_id"], m.canonical(action).decode()))
         return {"run_id": body["run_id"], "action_id": body["action_id"]}
 
-    def _dispatch(self, db, body, lease):
+    def _dispatch(self, db, body, lease, knowledge_check=None):
         m.fields(body, "action_id observed_binding")
         action = self._action(db, body["action_id"])
         state = self._load(db, action["run_id"])
@@ -560,8 +570,11 @@ class ControlStore:
             k = state["plan"]["knowledge"]
             m.require(not k["required"] or k["status"] == "SELECTED", "Required knowledge unavailable", "NOT_READY")
             if k["status"] == "SELECTED":
-                from .knowledge import require_adopted
+                from .knowledge import require_adopted, _ExecutionCheck
                 require_adopted(state)
+                m.require(isinstance(knowledge_check, _ExecutionCheck),
+                          'Fresh knowledge check required; dispatch through perform()', 'NOT_READY')
+                action['knowledge_check'] = knowledge_check.consume(self, action['action_id'], state)
             self._spend(state, "attempts", "max_attempts")
             state["attempt"]["submission_recorded"] = True
         counter, bound = {"query": ("queries", "max_queries"), "cancel": ("cancellations", "max_cancellations")}.get(kind, ("actions", "max_actions"))

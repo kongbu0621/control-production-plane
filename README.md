@@ -4,7 +4,7 @@
 
 它要解决的问题是：**一项任务交给执行器之后，如何持续推进，知道做到了哪一步，处理失败，并拿到能按原目标验收的成果。**
 
-**当前版本：`0.1.0a3` alpha · Linux / Python 3.12 · [MIT 许可](LICENSE)。** 已有运行记录核心、Local Hand 公共 CLI 适配、证据下载、Ledger 归档与指定版本读回，以及可选 K 知识采用与结果反馈。适配链路已通过合成验证，并在原部署完成一次真实 README 候选的执行、归档、指定版本读回与明确验收；P/K 已完成一次真实知识采用、候选验收与结果回流；组合恢复、其他故障边界和生产资格仍待验证。当前已实现入口见[开始使用](#开始使用)。
+**当前版本：`0.1.0a4` alpha · Linux / Python 3.12 · [MIT 许可](LICENSE)。** 已有运行记录核心、Local Hand 公共 CLI 适配、证据下载、Ledger 归档与指定版本读回，以及可选 K 知识采用与结果反馈。适配链路已通过合成验证，并在原部署完成一次真实 README 候选的执行、归档、指定版本读回与明确验收；P/K 已完成一次真实知识采用、候选验收与结果回流；组合恢复、其他故障边界和生产资格仍待验证。当前已实现入口见[开始使用](#开始使用)。
 
 ## 它负责什么
 
@@ -61,7 +61,7 @@
 python3.12 -m venv .venv
 .venv/bin/python -m pip install setuptools==84.0.0 wheel==0.48.0
 .venv/bin/python -m pip wheel --no-build-isolation --no-deps . -w dist
-.venv/bin/python -m pip install --no-deps dist/control_production_plane-0.1.0a3-py3-none-any.whl
+.venv/bin/python -m pip install --no-deps dist/control_production_plane-0.1.0a4-py3-none-any.whl
 ```
 
 首次体验可运行[本地记录示例](examples/local_records.py)，使用一个不存在的私有目录：
@@ -90,7 +90,7 @@ python3.12 -m venv .venv
 | `production-plane read-artifact --run-id ID` | 按准确成果/版本读回，校验实际内容并记录候选 |
 | `write` 的 `candidate` / `decide` 操作 | 保存已核对的候选与逐项验收决定 |
 | `production-plane query-knowledge` / `select-knowledge` | 查询匹配知识或核对指定版本的内容、条件与审查引用 |
-| `production-plane adopt-knowledge` | 按原尝试登记选定版本，取得使用回执后才允许依赖它的提交 |
+| `production-plane adopt-knowledge` | 按原尝试登记选定版本，保存原使用回执；新提交还须重新核对知识当前状态 |
 | `production-plane knowledge-feedback` / `resume-knowledge` | 保存原任务结果反馈，或沿原请求恢复知识调用 |
 | Python `initialize` / `open_store` | 显式创建或打开控制存储 |
 | Python `ControlStore.perform` | 为受信适配器保留调用意图、互斥和响应；需调用方提供适配器 |
@@ -99,7 +99,7 @@ python3.12 -m venv .venv
 
 执行和归档适配器需要在独立环境安装所选 Local Hand/Ledger 包，并使用显式的私有配置；配置与操作顺序见[执行、归档与验收](docs/ADAPTERS.md)。本组件按保存的任务方案逐步调用，不自动生成修复方案，也不自动应用补丁或提交 Git。
 
-知识适配器的安装、配置、采用顺序及恢复方法见[接入运行知识](docs/KNOWLEDGE.md)。查询不会登记采用；采用回执也不代表任务已执行，实际结果单独记录。
+知识适配器的安装、配置、采用顺序及恢复方法见[接入运行知识](docs/KNOWLEDGE.md)。查询不会登记采用；采用回执也不代表任务已执行。选用知识的任务提交时提供 `--knowledge-adapter`，重新核对原版本仍有效、适用条件和材料内容；已撤回或当前无法核对时停止新提交，实际结果单独记录。
 
 ## 文档
 
