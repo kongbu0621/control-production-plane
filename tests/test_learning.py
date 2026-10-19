@@ -215,7 +215,7 @@ a.deliver(v['candidate'],v['proposal'])
         self.assertEqual(self.adapter().deliver(cid,self.proposal())['delivery'],'RECEIVED')
 
     def test_delivery_accepts_existing_short_and_maximum_scope_configurations(self):
-        for index, scope in enumerate(('p', 'pk', 'p' * 128)):
+        for index, scope in enumerate(('p', 'pk', 'p' * 128, 'p' * 129, 'p' * 255, 'p' * 256)):
             with self.subTest(scope_length=len(scope)):
                 cid = self.candidate('learning:scope-' + str(index))['candidate_id']
                 config = dict(self.config, scope=scope)

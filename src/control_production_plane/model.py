@@ -104,6 +104,11 @@ def identity(value):
     require(type(value) is str and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}", value), "Invalid identity")
 
 
+def request_scope(value):
+    require(type(value) is str and 1 <= len(value) <= 256
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]*", value), "Invalid request scope")
+
+
 def sha(value):
     require(type(value) is str and re.fullmatch(r"[0-9a-f]{64}", value), "Expected SHA-256")
 

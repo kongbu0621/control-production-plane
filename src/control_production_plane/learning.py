@@ -75,7 +75,7 @@ def save(db, candidate):
 def record_intent(store, db, body):
     m.fields(body, 'candidate_id knowledge_store_id scope proposal')
     m.identity(body['knowledge_store_id'])
-    m.identity(body['scope'])
+    m.request_scope(body['scope'])
     spec = proposal_spec(body['proposal'])
     candidate = load(db, body['candidate_id'])
     old = candidate.get('delivery_record')

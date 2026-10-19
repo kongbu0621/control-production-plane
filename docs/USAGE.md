@@ -11,7 +11,7 @@ python3.12 -m venv .build-venv
 .build-venv/bin/python -m pip install setuptools==84.0.0 wheel==0.48.0
 .build-venv/bin/python -m pip wheel --no-build-isolation --no-deps . -w dist
 python3.12 -m venv /absolute/private/production-runtime
-/absolute/private/production-runtime/bin/python -m pip install --no-index --no-deps dist/control_production_plane-0.1.0a5-py3-none-any.whl
+/absolute/private/production-runtime/bin/python -m pip install --no-index --no-deps dist/control_production_plane-0.1.0a6-py3-none-any.whl
 ```
 
 有离线 wheel 缓存时，为构建依赖安装加 `--no-index --find-links /path/to/verified-wheelhouse`。不要复用其他项目的运行环境，也不要把运行数据放进源码目录。首次初始化只接受不存在的存储目录，其父目录需要已存在。

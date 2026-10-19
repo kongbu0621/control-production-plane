@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "control-production-plane"
-version = "0.1.0a5"
+version = "0.1.0a6"
 description = "Durable local coordination records for software production tasks"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -15,7 +15,7 @@ dependencies = []
 classifiers = ["Development Status :: 3 - Alpha", "Operating System :: POSIX :: Linux", "Programming Language :: Python :: 3.12"]
 
 [project.optional-dependencies]
-knowledge = ["domain-operational-knowledge-core==0.1.0a2"]
+knowledge = ["domain-operational-knowledge-core==0.1.0a3"]
 
 [project.scripts]
 production-plane = "control_production_plane.cli:main"

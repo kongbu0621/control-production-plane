@@ -1,6 +1,6 @@
 # 运行记录核心公共接口
 
-适用版本：`0.1.0a5`，命令 schema 为 `production-plane-v1`，本地存储格式为 `production-plane-store-v1`。包含本地运行记录、静态 CLI 适配、候选及明确的验收决定；存储格式保持兼容，使用新功能后应继续用本版读取。
+适用版本：`0.1.0a6`，命令 schema 为 `production-plane-v1`，本地存储格式为 `production-plane-store-v1`。包含本地运行记录、静态 CLI 适配、候选及明确的验收决定；存储格式保持兼容，使用新功能后应继续用本版读取。
 
 ## 使用边界
 
@@ -181,7 +181,7 @@ SELECTED 提交还会在 dispatch 事务内检查原请求、知识观察及完�
 
 ## 学习候选投递（0.1.0a5）
 
-`control_production_plane.learning.LearningAdapter(store, config)` 使用与 KnowledgeAdapter 相同的明确 K 配置。其中 `scope` 沿用 P 配置的 1–128 个 ASCII 字符的标识约束，`p`、`pk` 等短作用域有效；不要套用 K 材料 ID 至少三个字符的约束。`deliver(candidate_id, proposal)` 保存原意图并推进两步；`resume_delivery(candidate_id)` 只用保留请求接续。CLI 对应 `deliver-learning --candidate-id ID --proposal FILE --adapter FILE`、`resume-learning --candidate-id ID --adapter FILE`；`show-learning --candidate-id ID` 读取原候选及当前投递记录。
+`control_production_plane.learning.LearningAdapter(store, config)` 使用与 KnowledgeAdapter 相同的明确 K 配置。其中 `scope` 沿用 P 配置的 1–256 个 ASCII 字符的标识约束，`p`、`pk` 等短作用域有效；不要套用 K 材料 ID 至少三个字符的约束。`deliver(candidate_id, proposal)` 保存原意图并推进两步；`resume_delivery(candidate_id)` 只用保留请求接续。CLI 对应 `deliver-learning --candidate-id ID --proposal FILE --adapter FILE`、`resume-learning --candidate-id ID --adapter FILE`；`show-learning --candidate-id ID` 读取原候选及当前投递记录。
 
 proposal 恰含 `kind content conditions context gaps material_ids`。kind 为 1–64 UTF-8 bytes，content 为 1–65536 bytes，均拒绝 NUL；context/conditions 沿用 K 的最多 16 项字符串映射。gaps 最多 15 条非空、无 NUL、至多 512 bytes 的说明；material_ids 为 0–7 个不同的已有 K 材料 ID，额外加上本次发布的运行材料。完整请求和投递记录仍受 P 的 256 KiB ASCII JSON/结构限额约束，扩展转义后的容量不足在首次 K 写入前拒绝。
 
@@ -189,4 +189,10 @@ proposal 恰含 `kind content conditions context gaps material_ids`。kind 为 1
 
 适配器使用两个本地命令（均需原执行租约）：`learning_intent` 的 body 为 candidate_id、knowledge_store_id、scope、proposal；`learning_ack` 为 candidate_id、operation、receipt。它们与 P 事件和本地回执同事务提交，应由适配器构造。直接写入的回执仍处于受信本地调用边界内，不是外部身份认证。`recover` 继续报告生产与知识采用调用；学习投递用原 candidate_id 经 show-learning/resume-learning 接续。
 
-材料保留首次投递时的原尝试观察，晚到的取消、修订或结果不会重写它。候选说明和 evidence_refs 是调用方声明；artifact_versions 需与原尝试已记录成果匹配，但本适配器不重新下载成果原件。额外 K 材料由 propose 核对，缺失时保留已完成发布及待决提案。投递不调用 review/start_use，不修改生产状态或业务预算。使用投递字段后继续用 `0.1.0a5` 或兼容后续版本，不回退旧写入者。
+材料保留首次投递时的原尝试观察，晚到的取消、修订或结果不会重写它。候选说明和 evidence_refs 是调用方声明；artifact_versions 需与原尝试已记录成果匹配，但本适配器不重新下载成果原件。额外 K 材料由 propose 核对，缺失时保留已完成发布及待决提案。投递不调用 review/start_use，不修改生产状态或业务预算。投递字段自 `0.1.0a5` 引入；超过 128 字符的作用域需使用 `0.1.0a6` 或兼容后续版本，不回退不支持这些记录的旧写入者。
+
+## 请求作用域长度（0.1.0a6）
+
+知识采用/反馈与学习候选投递共用 1–256 个 ASCII 字符的请求作用域：首字符为字母或数字，其余允许字母、数字、`.`、`_`、`:`、`/`、`-`。257 字符及非法字符在保存意图前拒绝。任务、请求和材料 ID 的原有限额，以及知识条目中描述适用条件的 `scope` 字段均不受此变更影响。
+
+长作用域需要 K `0.1.0a3`；同步安装两边再使用，旧 K 仍只接受 128 UTF-8 bytes。原数据库表、请求身份计算和已有回执不变，无需迁移或重发。写入长作用域后，应持续使用支持该长度的版本读取和恢复，不能将其交回旧校验器。

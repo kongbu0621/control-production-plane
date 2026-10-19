@@ -163,7 +163,7 @@ def record_intent(store, db, body):
     req = body["request"]
     m.fields(req, "schema scope operation request_id body")
     m.require(req["schema"] == "operational-knowledge-v1", "Unsupported K schema")
-    m.identity(req["scope"])
+    m.request_scope(req["scope"])
     op = req["operation"]
     m.require(op in ("start_use", "complete_use"), "Unsupported K operation")
     cid = key(store.identity["store_id"], original, op)
@@ -237,8 +237,8 @@ class KnowledgeAdapter:
         m.fields(config, "store_path store_id anchor scope")
         m.fields(config["anchor"], "scope operation request_id fingerprint")
         m.require(type(config["store_path"]) is str and Path(config["store_path"]).is_absolute(), "K path must be absolute")
-        for field in ("store_id", "scope"):
-            m.identity(config[field])
+        m.identity(config["store_id"])
+        m.request_scope(config["scope"])
         m.sha(config["anchor"]["fingerprint"])
         self.store, self.config = store, json.loads(m.canonical(config))
 

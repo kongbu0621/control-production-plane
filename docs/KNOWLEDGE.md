@@ -4,7 +4,7 @@ P 可以通过独立 K 组件查询已审查知识、采用准确版本，再把
 
 ## 安装与配置
 
-在 P 的独立 Python 3.12 环境安装已核对的 `domain-operational-knowledge-core==0.1.0a2` 和 `infra-artifact-ledger==0.2.0a1` wheel。P 提供 `knowledge` 可选依赖组；包尚未发布到 PyPI，按各仓说明构建后从本地 wheel 安装。不使用 K 的调用者不必安装它。
+在 P 的独立 Python 3.12 环境安装已核对的 `domain-operational-knowledge-core==0.1.0a3` 和 `infra-artifact-ledger==0.2.0a1` wheel。P 提供 `knowledge` 可选依赖组；包尚未发布到 PyPI，按各仓说明构建后从本地 wheel 安装。不使用 K 的调用者不必安装它。
 
 K 必须是已经初始化并完成生命周期升级的原存储。P 不替用户创建、迁移或覆盖 K 数据。配置文件应位于调用者私有目录，权限 `0600`：
 
@@ -21,6 +21,8 @@ K 必须是已经初始化并完成生命周期升级的原存储。P 不替用�
   "scope": "example:production"
 }
 ```
+
+`scope` 为 1–256 个 ASCII 字符的请求作用域，命名字符规则见[公共接口](INTERFACE.md#请求作用域长度010a6)。使用超过 128 字符的名称需要配套 K `0.1.0a3`。
 
 这是字段示意，必须换成真实原回执。`anchor` 可引用既有审查等成功操作。P 在任何 K 写入前调用 `get_operation` 核对其存储身份与摘要；路径相同不代表还是原数据库。锚点只证明所连数据身份，不授予权限，也不要求原版本永远处于 ACTIVE。P 不读取 K 私有表或导入 K 私有实现。
 
