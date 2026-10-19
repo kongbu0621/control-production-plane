@@ -63,6 +63,13 @@ def main(argv=None):
             sub.add_argument("--notes", required=True)
         if name == "resume-knowledge":
             sub.add_argument("--call-id", required=True)
+    for name in ("show-learning", "deliver-learning", "resume-learning"):
+        sub = commands.add_parser(name)
+        sub.add_argument("--candidate-id", required=True)
+        if name != "show-learning":
+            sub.add_argument("--adapter", required=True, type=Path)
+        if name == "deliver-learning":
+            sub.add_argument("--proposal", required=True, type=Path)
     args = parser.parse_args(argv)
     mutated = False
     try:
@@ -78,6 +85,15 @@ def main(argv=None):
                 data = store.recover(args.run_id)
             elif args.command == "events":
                 data = store.events(args.run_id, after=args.after, limit=args.limit)
+            elif args.command == "show-learning":
+                data = store.get_candidate(args.candidate_id)
+            elif args.command in ("deliver-learning", "resume-learning"):
+                from .learning import LearningAdapter
+                from .calls import retained
+                adapter = LearningAdapter(store, decode(retained(args.adapter)))
+                data = (adapter.deliver(args.candidate_id, decode(retained(args.proposal)))
+                        if args.command == "deliver-learning" else adapter.resume_delivery(args.candidate_id))
+                mutated = True
             elif args.command in ("inspect-executor", "execute-action", "reconcile-action", "collect-evidence"):
                 from .local_hand import LocalHandAdapter
                 from .calls import retained

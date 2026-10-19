@@ -60,7 +60,7 @@ P 先事务保存调用意图，再调用 K，最后保存 K 回执。三者不�
 - 旧版未预留容量的 pending：先查 K 原回执；已有成功结果就补记它，尚无成功回执时先事务补记容量预留，再按原请求接续。已取消或被替换的旧采用不新增预留或写入；旧记录自身已满、不能保存回执时保留待确认状态，不能清空历史或换 ID 重写 K。
 - 迟到反馈：仍绑定原修订、原任务和原使用，不套用到新尝试。初始反馈一旦保存意图，其事实快照和说明固定；重试不以最新状态覆盖旧快照。
 
-首版支持一次初始反馈；需要后来纠正时使用 K 的正式 `correct_feedback` 合同并保留原回执，本版 P 尚无修正适配器。`learning_candidate` 仍只保存本地待审候选，不声称已投递。P/K/Ledger 组合备份恢复、跨副本写实例隔离及任意多个知识版本组合不在本次完成范围。
+首版支持一次初始反馈；需要后来纠正时使用 K 的正式 `correct_feedback` 合同并保留原回执，本版 P 尚无修正适配器。`learning_candidate` 命令只创建本地待审候选；随后可用[学习候选投递入口](#投递明确的学习候选)接通 K，接收回执与准入决定分别记录。P/K/Ledger 组合备份恢复、跨副本写实例隔离及任意多个知识版本组合不在本次完成范围。
 
 ## 执行前的当前状态检查（0.1.0a4）
 
@@ -79,3 +79,33 @@ P 先事务保存调用意图，再调用 K，最后保存 K 回执。三者不�
 一致但过旧的 K 副本可能仍显示 ACTIVE；原锚点和当前读取不能自行证明它没有遗漏快照后的退休。本能力不自动启用恢复副本。组合恢复仍需由组装流程核对恢复点、已知后续决定和未知范围，停止或隔离原写入者后显式选择当前实例；P、K、Ledger 各自保留其状态责任。
 
 五个安装态合成组合恢复窗口及操作顺序见[组合恢复核对](COMBINED_RECOVERY.md)。旧快照遗漏后来退休和不同副本的锁相互独立均已实际复现；演练中的后续回执对账和写入者检查属于协调步骤，不是本库新增的自动副本启用接口。
+
+## 投递明确的学习候选
+
+先用 `write` 的 `learning_candidate` 保存原 run_id、attempt_id、candidate_id、explanation、evidence_refs、artifact_versions。候选应有实际来源；说明和引用的真实性由调用方负责。投递的材料包括原尝试观察，确认这些内容处于允许分享的受信 K 数据域后使用原适配配置。
+
+proposal.json 示例（字段限制见公共接口）：
+
+```json
+{
+  "kind": "result-attribution-guidance",
+  "content": "Separate observations made before knowledge adoption from later outcomes.",
+  "conditions": {"task_type": "documentation"},
+  "context": {"task_type": "documentation"},
+  "gaps": ["Synthetic example; no claim of improved success rate."],
+  "material_ids": []
+}
+```
+
+```sh
+production-plane --store /absolute/private/production deliver-learning \
+  --candidate-id learning:example --adapter /absolute/private/k-adapter.json \
+  --proposal /absolute/private/proposal.json
+production-plane --store /absolute/private/production show-learning --candidate-id learning:example
+production-plane --store /absolute/private/production resume-learning \
+  --candidate-id learning:example --adapter /absolute/private/k-adapter.json
+```
+
+首次保存两个准确请求，随后依次发布材料、登记候选；中断后保持原 candidate_id、配置和内容。收到材料回执但候选未确认仍为 PENDING；同请求恢复不会生成另一个候选或重新执行生产。若 K 只完成材料的 Ledger 写入，其原请求同样可以接续。不要通过换候选 ID、清空原记录或覆盖目的库处理未知结果。
+
+RECEIVED 表示已收到 K 提案回执。它不是审查通过，正式知识查询不会因此出现该候选。审查者应从 K 读取当前候选和准确材料，并通过 K 公共 review 明确决定；后续任务采用准确知识版本与回流效果仍是独立步骤。

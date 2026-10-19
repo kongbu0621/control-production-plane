@@ -400,7 +400,8 @@ class ControlStore:
                     "not_started": self._not_started, "candidate": self._candidate,
                     "decide": self._decide, "confirm_not_accepted": self._confirm_not_accepted,
                     "confirm_stopped": self._confirm_stopped,
-                    "knowledge_intent": self._knowledge_intent, "knowledge_ack": self._knowledge_ack}
+                    "knowledge_intent": self._knowledge_intent, "knowledge_ack": self._knowledge_ack,
+                    "learning_intent": self._learning_intent, "learning_ack": self._learning_ack}
         m.require(type(operation) is str and operation in handlers, "Unknown operation")
         fingerprint = m.digest(request)
         committing = False
@@ -438,6 +439,18 @@ class ControlStore:
     def _new_attempt(revision):
         return {"attempt_id": str(uuid.uuid4()), "operation_id": str(uuid.uuid4()), "revision": revision,
                 "prepared_request": None, "submission_recorded": False, "observation": None}
+
+    def _learning_intent(self, db, body, lease):
+        from .learning import record_intent
+        m.require(isinstance(lease, _Lease), "Executor lease required", "LEASE_REQUIRED")
+        lease.verify(self)
+        return record_intent(self, db, body)
+
+    def _learning_ack(self, db, body, lease):
+        from .learning import record_ack
+        m.require(isinstance(lease, _Lease), "Executor lease required", "LEASE_REQUIRED")
+        lease.verify(self)
+        return record_ack(self, db, body)
 
     def _knowledge_intent(self, db, body, lease):
         from .knowledge import record_intent
@@ -891,7 +904,10 @@ class ControlStore:
                         delivery="UNCONFIGURED", admission="NOT_REQUESTED")
         existing = db.execute("SELECT document FROM candidates WHERE candidate_id=?", (body["candidate_id"],)).fetchone()
         if existing:
-            m.require(json.loads(existing[0]) == document, "Candidate ID binds other content", "CONFLICT")
+            from .learning import source
+            m.require(source(json.loads(existing[0])) == source(document), "Candidate ID binds other content", "CONFLICT")
+            document = json.loads(existing[0])
         else:
             db.execute("INSERT INTO candidates VALUES (?,?,?)", (body["candidate_id"], body["run_id"], m.canonical(document).decode()))
-        return {"run_id": body["run_id"], "candidate_id": body["candidate_id"], "delivery": "UNCONFIGURED", "admission": "NOT_REQUESTED"}
+        return {"run_id": body["run_id"], "candidate_id": body["candidate_id"],
+                "delivery": document["delivery"], "admission": document["admission"]}

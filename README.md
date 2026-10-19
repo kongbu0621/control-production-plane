@@ -4,7 +4,7 @@
 
 它要解决的问题是：**一项任务交给执行器之后，如何持续推进，知道做到了哪一步，处理失败，并拿到能按原目标验收的成果。**
 
-**当前版本：`0.1.0a4` alpha · Linux / Python 3.12 · [MIT 许可](LICENSE)。** 已有运行记录核心、Local Hand 公共 CLI 适配、证据下载、Ledger 归档与指定版本读回，以及可选 K 知识采用与结果反馈。适配链路已通过合成验证，并在原部署完成一次真实 README 候选的执行、归档、指定版本读回与明确验收；P/K 已完成一次真实知识采用、候选验收与结果回流；另已通过五个安装态合成组合恢复窗口，以及已有真实试点的只读恢复对账；真实副本切换、其他故障边界和生产资格仍待验证。当前已实现入口见[开始使用](#开始使用)。
+**当前版本：`0.1.0a5` alpha · Linux / Python 3.12 · [MIT 许可](LICENSE)。** 已有运行记录核心、Local Hand 公共 CLI 适配、证据下载、Ledger 归档与指定版本读回，以及可选 K 知识采用、结果反馈和明确学习候选的可靠投递。适配链路已通过合成验证，并在原部署完成一次真实 README 候选的执行、归档、指定版本读回与明确验收；P/K 已完成一次真实知识采用、候选验收与结果回流；另已通过五个安装态合成组合恢复窗口，以及已有真实试点的只读恢复对账；真实副本切换、其他故障边界和生产资格仍待验证。当前已实现入口见[开始使用](#开始使用)。
 
 ## 它负责什么
 
@@ -51,7 +51,7 @@
 - 首个执行适配面向 Local Hand 已登记的 `workspace.edit` 能力；不承诺任意项目、任意命令或任意执行器可用。
 - 修复方案由调用方提供。模型生成方案、多执行器选择、并行调度和图形界面留待真实需要明确后扩展。
 - 控制组件消费执行观察和验收决定；不会把“收到响应”“退出码为零”或“成果已保存”自动等同于目标完成。
-- 可选知识适配器支持每次尝试采用一个准确版本，保留采用意图、回执及结果反馈；知识缺席时能否继续，按任务预先确定的条件判断。学习候选的自动投递与准入不在本版范围内。
+- 可选知识适配器支持每次尝试采用一个准确版本，保留采用意图、回执及结果反馈；知识缺席时能否继续，按任务预先确定的条件判断。调用方明确提供学习候选后，可发布原运行材料并投递到 K，保存接收回执；候选形成与准入判断仍由调用方和审查者负责。
 
 ## 开始使用
 
@@ -61,7 +61,7 @@
 python3.12 -m venv .venv
 .venv/bin/python -m pip install setuptools==84.0.0 wheel==0.48.0
 .venv/bin/python -m pip wheel --no-build-isolation --no-deps . -w dist
-.venv/bin/python -m pip install --no-deps dist/control_production_plane-0.1.0a4-py3-none-any.whl
+.venv/bin/python -m pip install --no-deps dist/control_production_plane-0.1.0a5-py3-none-any.whl
 ```
 
 首次体验可运行[本地记录示例](examples/local_records.py)，使用一个不存在的私有目录：
@@ -92,6 +92,7 @@ python3.12 -m venv .venv
 | `production-plane query-knowledge` / `select-knowledge` | 查询匹配知识或核对指定版本的内容、条件与审查引用 |
 | `production-plane adopt-knowledge` | 按原尝试登记选定版本，保存原使用回执；新提交还须重新核对知识当前状态 |
 | `production-plane knowledge-feedback` / `resume-knowledge` | 保存原任务结果反馈，或沿原请求恢复知识调用 |
+| `production-plane show-learning` / `deliver-learning` / `resume-learning` | 读取本地学习候选、投递到 K，或核对原请求并接续；接收不等于准入 |
 | Python `initialize` / `open_store` | 显式创建或打开控制存储 |
 | Python `ControlStore.perform` | 为受信适配器保留调用意图、互斥和响应；需调用方提供适配器 |
 

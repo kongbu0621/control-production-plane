@@ -1,6 +1,6 @@
 # 运行记录核心公共接口
 
-适用版本：`0.1.0a4`，命令 schema 为 `production-plane-v1`，本地存储格式为 `production-plane-store-v1`。包含本地运行记录、静态 CLI 适配、候选及明确的验收决定；存储格式保持兼容，使用新功能后应继续用本版读取。
+适用版本：`0.1.0a5`，命令 schema 为 `production-plane-v1`，本地存储格式为 `production-plane-store-v1`。包含本地运行记录、静态 CLI 适配、候选及明确的验收决定；存储格式保持兼容，使用新功能后应继续用本版读取。
 
 ## 使用边界
 
@@ -97,7 +97,7 @@ store = initialize("/absolute/private/new-control-store")
 
 `observe` 的 `remote_state` 为 `NOT_FOUND`、`RUNNING`、`TERMINAL`；`outcome` 为 `UNKNOWN`、`SUCCEEDED`、`FAILED`、`CANCELLED`。非终态必须保持 UNKNOWN；`exited=true` 只允许终态。`evidence_state` 为 `UNKNOWN`、`STAGING`、`SEALED`，与业务结果分开。查询未找到不会释放原提交额度；取消请求不能覆盖先完成的业务结果。此接口保存适配器核对后的观察，不代替读取原始执行证据。
 
-学习候选自动绑定目标摘要、计划修订、执行任务和部署绑定，至少提供一项来源引用。`artifact_versions` 每项恰含 `artifact_id`、`version_id`。本版只保存本地候选，固定返回 `delivery=UNCONFIGURED`、`admission=NOT_REQUESTED`；同候选 ID 改内容拒绝，不假报已回流或已准入。
+学习候选自动绑定目标摘要、计划修订、执行任务和部署绑定，至少提供一项来源引用。`artifact_versions` 每项恰含 `artifact_id`、`version_id`。初次创建返回 `delivery=UNCONFIGURED`、`admission=NOT_REQUESTED`；同候选 ID 改内容拒绝。投递后 `get_candidate` 另含当前状态与 `delivery_record`，历史创建回执不改写。
 
 ## 候选、使用记录与决定
 
@@ -178,3 +178,15 @@ store = initialize("/absolute/private/new-control-store")
 `execute-action` 增加 `--knowledge-adapter FILE`，文件格式与已有知识命令的 `--adapter` 相同。`action.knowledge_check` 是随当次 dispatch 保存的历史观察，不能重放为许可。检查失败保留 QUEUED 和 `preflight_failure`，不花业务额度；已经 MAY_HAVE_RUN 的动作不重新提交。详细窗口和错误语义见[知识接入](KNOWLEDGE.md)。旧安装没有该检查，执行这类任务的进程应统一升级；本版没有改写旧账本或强制迁移数据库。
 
 SELECTED 提交还会在 dispatch 事务内检查原请求、知识观察及完整 `max_response_bytes` 是否共同满足动作记录的 256 KiB 上限。容量不足返回 `LIMIT`，不登记提交、不消耗执行额度、不调用业务；既有动作与原采用保留。该字节容量检查不改变响应 schema、结构限额或实际 I/O 失败的处理。
+
+## 学习候选投递（0.1.0a5）
+
+`control_production_plane.learning.LearningAdapter(store, config)` 使用与 KnowledgeAdapter 相同的明确 K 配置。`deliver(candidate_id, proposal)` 保存原意图并推进两步；`resume_delivery(candidate_id)` 只用保留请求接续。CLI 对应 `deliver-learning --candidate-id ID --proposal FILE --adapter FILE`、`resume-learning --candidate-id ID --adapter FILE`；`show-learning --candidate-id ID` 读取原候选及当前投递记录。
+
+proposal 恰含 `kind content conditions context gaps material_ids`。kind 为 1–64 UTF-8 bytes，content 为 1–65536 bytes，均拒绝 NUL；context/conditions 沿用 K 的最多 16 项字符串映射。gaps 最多 15 条非空、无 NUL、至多 512 bytes 的说明；material_ids 为 0–7 个不同的已有 K 材料 ID，额外加上本次发布的运行材料。完整请求和投递记录仍受 P 的 256 KiB ASCII JSON/结构限额约束，扩展转义后的容量不足在首次 K 写入前拒绝。
+
+`delivery_record` 包含 `schema=production-learning-delivery-v1`、knowledge_store_id、scope、proposal、source_sha256、requests 和 receipts。requests/receipts 分别以 publish_material、propose 为键；每个成功回执保存 K 完整身份、请求指纹及结果。RECEIVED 需要两个回执，部分完成保留 PENDING。返回值包含 candidate_id、delivery、admission 和 receipts；K 的 candidate_id/candidate_sha256 在 propose 回执中。
+
+适配器使用两个本地命令（均需原执行租约）：`learning_intent` 的 body 为 candidate_id、knowledge_store_id、scope、proposal；`learning_ack` 为 candidate_id、operation、receipt。它们与 P 事件和本地回执同事务提交，应由适配器构造。直接写入的回执仍处于受信本地调用边界内，不是外部身份认证。`recover` 继续报告生产与知识采用调用；学习投递用原 candidate_id 经 show-learning/resume-learning 接续。
+
+材料保留首次投递时的原尝试观察，晚到的取消、修订或结果不会重写它。候选说明和 evidence_refs 是调用方声明；artifact_versions 需与原尝试已记录成果匹配，但本适配器不重新下载成果原件。额外 K 材料由 propose 核对，缺失时保留已完成发布及待决提案。投递不调用 review/start_use，不修改生产状态或业务预算。使用投递字段后继续用 `0.1.0a5` 或兼容后续版本，不回退旧写入者。
