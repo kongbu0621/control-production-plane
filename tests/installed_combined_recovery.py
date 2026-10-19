@@ -51,6 +51,21 @@ def hashes(directory):
             for path in sorted(directory.rglob('*')) if path.is_file()}
 
 
+def events(store):
+    result, after = [], 0
+    # These fixtures have a small, finite history. Check pagination progress
+    # too, so a faulty read cannot hang the acceptance program.
+    for _ in range(100):
+        page = store.events('example', after=after, limit=10)
+        if not page:
+            return result
+        for event in page:
+            require(event['sequence'] > after, 'Event pagination did not advance')
+            after = event['sequence']
+        result.extend(page)
+    raise RuntimeError('Synthetic event history exceeded its bound')
+
+
 def command(operation, body):
     return dict(schema='production-plane-v1', request_id=str(uuid.uuid4()), operation=operation, body=body)
 
@@ -185,9 +200,12 @@ KnowledgeAdapter(p, json.load(open(sys.argv[2]))).adopt('example', {'project':'e
     k_before, ledger_before = hashes(f.root / 'recovered/k'), hashes(f.ledger_dir)
     adapter.resume('example', cid)
     restored = p.get_run('example')
-    require(restored['knowledge_calls'][cid]['receipt'] == receipt, 'A different K receipt was adopted')
-    require(restored['attempt']['operation_id'] == state['attempt']['operation_id']
-            and restored['counters'] == state['counters'], 'Recovery changed execution identity or budget')
+    require(restored['knowledge_calls'][cid]['state'] == 'COMMITTED', 'Recovered K receipt was not committed')
+    expected = json.loads(encode(state))
+    expected['knowledge_calls'][cid].update(state='COMMITTED', receipt=receipt)
+    expected['knowledge_calls'][cid].pop('receipt_capacity_version', None)
+    require(restored == expected, 'Receipt recovery changed the original request, identity, budget or receipt')
+    save(f.root / 'recovered-adoption.json', restored)
     p_after = hashes(p.root)
     adapter.resume('example', cid)
     require(hashes(p.root) == p_after, 'Repeated receipt recovery wrote new P records')
@@ -203,15 +221,22 @@ def older_material_snapshot(f):
     aid = f.prepare(); current = f.snapshot('with-materials')
     p, adapter, k = f.clone()
     f.restore_materials(f.early, 'retained-complete-ledger')
-    before = hashes(p.root)
+    before_state, before_action, before_events = p.get_run('example'), p.get_action(aid), events(p)
     material = k.get('version', f.version)['materials']
     require(any(item['status'] != 'VERIFIED' for item in material), 'Old Ledger unexpectedly contains later material')
     calls = []
     invoke = lambda _: calls.append('business') or dict(response={}, call_closed=True)
     expect_error('KNOWLEDGE_UNAVAILABLE', lambda: p.perform(aid, f.binding, invoke, knowledge=adapter))
-    require(not calls and p.get_action(aid)['state'] == 'QUEUED', 'Missing material allowed a submission')
-    require(p.get_run('example')['counters']['attempts'] == 0, 'Missing material consumed business budget')
-    require(hashes(p.root) != before, 'Expected the failed preflight event to be preserved')
+    require(not calls and p.get_action(aid) == before_action and before_action['state'] == 'QUEUED',
+            'Missing material allowed a submission or changed the queued request')
+    require(p.get_run('example') == before_state, 'Missing material changed the original run or budget')
+    after_events = events(p)
+    require(after_events[:len(before_events)] == before_events, 'Failed preflight changed original events')
+    added = after_events[len(before_events):]
+    require(len(added) == 1 and added[0]['operation'] == 'preflight_failure'
+            and added[0]['body'] == dict(action_id=aid, code='KNOWLEDGE_UNAVAILABLE'),
+            'Expected the exact failed preflight event to be preserved')
+    save(f.root / 'failed-preflight-event.json', added[0])
     # Restore correct materials, then READ the same task/version again. Do not
     # use an isolated acceptance run to authorize live execution of this copy.
     f.restore_materials(current, 'retained-older-ledger')
@@ -247,9 +272,13 @@ def known_later_retirement(f):
     observed = correct_k.get_operation(expected['scope'], expected['operation'], expected['request_id'])
     require(observed['receipt'] == expected and observed['observation']['record_status'] == 'AVAILABLE',
             'Complete copy did not retain the original retirement')
+    version = correct_k.get('version', f.version)
+    require(version['record']['version_id'] == f.version and version['record']['state'] == 'RETIRED',
+            'Complete copy did not report the original version as RETIRED')
+    save(f.root / 'complete-copy-retirement.json', dict(operation=observed, version=version))
     expect_error('NOT_READY', lambda: correct_adapter.check_execution(correct_p.get_run('example')))
     return dict(result='STALE_K_DETECTED_BY_KNOWN_LATER_DECISION', stale_check_state=stale['state'],
-                restored_copy_use='HISTORICAL_READ_ONLY', complete_copy_state='RETIRED', business_submissions=0)
+                restored_copy_use='HISTORICAL_READ_ONLY', complete_copy_state=version['record']['state'], business_submissions=0)
 
 
 def unknown_submission(f):
@@ -258,11 +287,20 @@ def unknown_submission(f):
         effects.append('synthetic-effect')
         raise OSError('Synthetic response lost after effect')
     expect_error('CALL_UNKNOWN', lambda: f.p.perform(aid, f.binding, lost, knowledge=f.adapter))
+    original_state, original_action = f.p.get_run('example'), f.p.get_action(aid)
+    require(original_state['attempt']['submission_recorded'] is True
+            and original_action['state'] == 'RESPONDED' and original_action['call_closed'] is False
+            and original_action['response'] == {'transport_error': 'OSError'}, 'Unknown submission gap was not retained')
     snapshot = f.snapshot('with-materials')
     p, adapter, _ = f.clone()
     f.restore_materials(snapshot, 'retained-original-ledger')
     before = hashes(p.root)
-    require(p.recover('example')['next_step'] == 'QUERY_ORIGINAL_TASK', 'Recovery advice lost the unknown original submission')
+    advice = p.recover('example')
+    require(advice['next_step'] == 'QUERY_ORIGINAL_TASK' and advice['run'] == original_state
+            and p.get_action(aid) == original_action and advice['external_calls_made'] == 0
+            and advice['pending_calls'] == [dict(action_id=aid, kind='submit', state=original_action['state'])],
+            'Recovery advice lost or changed the unknown original submission')
+    save(f.root / 'original-task-recovery.json', dict(advice=advice, action=original_action))
     expect_error('PENDING', lambda: p.perform(aid, f.binding, lost, knowledge=adapter))
     require(len(effects) == 1 and hashes(p.root) == before, 'Recovery replayed or rewrote unknown business')
     return dict(result='UNKNOWN_SUBMISSION_RETAINED', synthetic_effects=1, recovery_effects=0)
@@ -293,16 +331,17 @@ with open_store(sys.argv[1]).executor():
         with p.executor():
             require(child.poll() is None, 'Fixture writer exited unexpectedly')
             # Getting the copy's lock does NOT establish source writer exit.
-            blocked = child.poll() is None
-        require(blocked, 'A live source writer was treated as isolated')
+            original_alive = child.poll() is None
+        require(original_alive, 'Original writer exited before the copy lock check')
         out, err = child.communicate(b'x', timeout=10)
         require(child.returncode == 0 and not out and not err, 'Original writer exit/streams not confirmed')
     finally:
         if child.poll() is None:
             child.kill(); child.communicate(timeout=10)
     require(p.get_run('example')['counters']['attempts'] == 0, 'Writer probe submitted a task')
-    return dict(result='COPY_LOCK_IS_NOT_WRITER_FENCING', live_original_blocked=True,
-                original_child_exit=0, business_submissions=0, restored_copy_use='HISTORICAL_READ_ONLY')
+    return dict(result='COPY_LOCK_IS_NOT_WRITER_FENCING', original_lock_busy=True,
+                copy_lock_acquired_while_original_alive=original_alive,
+                original_child_exit=child.returncode, business_submissions=0, restored_copy_use='HISTORICAL_READ_ONLY')
 
 
 def main():
@@ -315,27 +354,30 @@ def main():
     for module in (p_api, k_api, ledger_api):
         require(Path(sys.prefix).resolve() in Path(module.__file__).resolve().parents, 'Use independently installed packages')
     root = Path(tempfile.mkdtemp(prefix='combined-recovery-', dir=args.scratch_parent.resolve(strict=True)))
-    print(json.dumps({'work_directory': str(root)}), flush=True)
-    report = dict(schema='synthetic-combined-recovery-v1', status='RUNNING', cases={},
-                  packages={name: importlib.metadata.version(name) for name in
+    report = dict(schema='synthetic-combined-recovery-v1', status='RUNNING', cases={}, activation_performed=False)
+    current_case = None
+    try:
+        print(json.dumps({'work_directory': str(root)}), flush=True)
+        report.update(packages={name: importlib.metadata.version(name) for name in
                             ('control-production-plane', 'domain-operational-knowledge-core', 'infra-artifact-ledger')},
                   implementation_sha256={module.__name__: {
                       str(path.relative_to(Path(module.__file__).parent)): hashlib.sha256(path.read_bytes()).hexdigest()
                       for path in sorted(Path(module.__file__).parent.rglob('*.py'))}
                       for module in (p_api, k_api, ledger_api)},
                   exercise_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-                  ledger_source_commit=args.ledger_source_commit, activation_performed=False)
-    try:
+                  ledger_source_commit=args.ledger_source_commit)
         for name, case in (('lost-adoption-reply', lost_adoption_reply), ('older-materials', older_material_snapshot),
                            ('later-retirement', known_later_retirement), ('unknown-submission', unknown_submission),
                            ('original-writer', original_writer)):
+            current_case = name
             result = case(Fixture(root / name, args.ledger_source_commit))
-            report['cases'][name] = result
             save(root / (name + '-result.json'), result)
+            report['cases'][name] = result
             print(json.dumps({'case': name, 'status': 'PASS', **result}), flush=True)
         report['status'] = 'PASS'
-    except Exception as exc:
-        report.update(status='FAIL', error_type=type(exc).__name__, error=str(exc))
+    except BaseException as exc:
+        report.update(status='INTERRUPTED' if isinstance(exc, (KeyboardInterrupt, SystemExit)) else 'FAIL',
+                      failed_case=current_case, error_type=type(exc).__name__, error=str(exc))
         raise
     finally:
         save(root / 'report.json', report)
