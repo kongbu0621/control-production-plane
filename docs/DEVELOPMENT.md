@@ -4,11 +4,13 @@
 
 Owner 批准推进反馈驱动的知识修订与后续采用。原 P 知识使用反馈明确记载 README 候选已 ACCEPT、原工作区未应用；当前目标仍与该候选的原文一致。这构成补全交付流程的实际依据，K 在原谱系中提出候选，经明确审查生成新版本，保留原知识和原反馈。详细准入、采用及结果回流见 K 的[开发记录](https://github.com/kongbu0621/domain-operational-knowledge-core/blob/main/docs/DEVELOPMENT.md)。
 
-本地调用方登记采用新知识后，复用原任务 `5ddc4c4b-7f4e-4d1e-9171-e78f79ff2d35` 的准确 Ledger 成果 `artifact:be973c72b50f4b878ce4f976780162e8` / `version:be973c72b50f4b878ce4f976780162e8`。重新核对归档回执、原请求、封存证据和 README 字节，再经 Local Hand 的本地应用入口完成 APPLIED，固定验证七项通过；随后发布到 Local Hand 主干 [`6fe2a3c`](https://github.com/kongbu0621/infra-local-hand/commit/6fe2a3cfb797c0df59c625228867fca4ceaef85a)。README 摘要仍为 `1614faa1eeef083640e4bf5e4991726151d7e34496edeafcd82402de8c5827ad`，没有重新生成候选。
+本地调用方在修订前已取回并校验原任务 `5ddc4c4b-7f4e-4d1e-9171-e78f79ff2d35` 的准确 Ledger 成果 `artifact:be973c72b50f4b878ce4f976780162e8` / `version:be973c72b50f4b878ce4f976780162e8`。核对覆盖归档回执、原请求、封存证据和 README 字节。登记采用新知识后复用这些成果，由 Local Hand 本地应用入口检查当前目标并完成 APPLIED，固定验证七项通过；随后发布到 Local Hand 主干 [`6fe2a3c`](https://github.com/kongbu0621/infra-local-hand/commit/6fe2a3cfb797c0df59c625228867fca4ceaef85a)。README 摘要仍为 `1614faa1eeef083640e4bf5e4991726151d7e34496edeafcd82402de8c5827ad`，没有重新生成候选。
 
 这是一项独立的后续本地交付，未给 P 创建新尝试或重发远端编辑。原 P 决定、原反馈、运行记录及成果数据库保持不变；新的应用和发布观察经 K 新使用的反馈保存。P 现场仍为原 `0.1.0a3`，源码的 `0.1.0a4` 未部署，也未升级原服务。新进程完整对账通过；私有核对脚本对当前知识状态的两次错误预期与后续修正如实保留在 K 记录中。
 
 已有冷备份及只读恢复结果继续表示当时的恢复点。原 K 版本当前已 SUPERSEDED，不能把旧快照中的 ACTIVE 当作新使用资格；新修订回执及后续使用需纳入将来的恢复范围。本次没有启用副本、验证跨实例写入隔离或新增独立 Generic Agent 验收。
+
+后续复核已纠正本节的动作顺序：成果取回和复用方案先于修订审查/采用，实际应用随后进行。K 经 `correct_feedback` 追加真实顺序及归因更正，保留原反馈，不再将既定复用方案归因为新知识的效果。更正仍绑定同一使用、版本和真实交付；独立对账及相同请求重放核对通过，没有新写 P 记录或重跑编辑任务。详见上方 K 开发记录。
 
 ## 真实恢复验收的子进程退出复核（2026-10-19）
 
