@@ -97,6 +97,42 @@ def feedback_material(store_id, state, usage, notes):
                 text=raw.decode())
 
 
+def validate_receipt_capacity(state):
+    """Keep room for bounded K receipts and cancellation while calls are pending.
+
+    Project placeholders only in memory; they are never persisted as evidence.
+    Legacy pending records gain this promise only through an explicit reservation.
+    """
+    calls = dict(state.get("knowledge_calls", {}))
+    reserved = False
+    for cid, call in calls.items():
+        if "receipt_capacity_version" not in call:
+            continue
+        m.require(type(call["receipt_capacity_version"]) is int and call["receipt_capacity_version"] == 1
+                  and call["state"] == "PENDING" and call["receipt"] is None,
+                  "Invalid K receipt reservation", "STORE_INVALID")
+        req = call["request"]
+        result = (dict(usage_id=req["body"]["usage_id"], reused=False) if req["operation"] == "start_use" else
+                  dict(material_id=req["body"]["material"]["material_id"], feedback_id="x" * 128, reused=False))
+        receipt = dict(store_id=call["knowledge_store_id"], scope=req["scope"], operation=req["operation"],
+                       request_id=req["request_id"], fingerprint="0" * 64, recorded_at=9007199254740991, result=result)
+        projected = dict(call, state="COMMITTED", receipt=receipt)
+        del projected["receipt_capacity_version"]
+        calls[cid] = projected
+        reserved = True
+    if reserved:
+        projected = dict(state, knowledge_calls=calls)
+        if projected["cancel"] is None:
+            # Any legal 2048-byte reason fits, including JSON escape expansion.
+            projected["cancel"] = dict(reason="\x00" * 2048, recorded_at=9007199254740991)
+        try:
+            m.validate_tree(projected)
+        except m.ControlError as exc:
+            if exc.code != "LIMIT":
+                raise
+            raise m.ControlError("LIMIT", "No capacity for pending K receipts and cancellation") from exc
+
+
 def record_intent(store, db, body):
     m.fields(body, "run_id revision knowledge_store_id request notes")
     m.identity(body["knowledge_store_id"])
@@ -117,6 +153,9 @@ def record_intent(store, db, body):
     if cid in calls:
         m.require(all(calls[cid][k] == v for k, v in record.items() if k not in ("state", "receipt")),
                   "Original K call binds different content", "CONFLICT")
+        if calls[cid]["state"] == "PENDING" and "receipt_capacity_version" not in calls[cid]:
+            calls[cid]["receipt_capacity_version"] = 1
+            store._save(db, state)
         return dict(run_id=state["run_id"], call_id=cid)
     consumer, task = refs(store.identity["store_id"], original)
     value = req["body"]
@@ -139,6 +178,7 @@ def record_intent(store, db, body):
         expected = dict(usage_id=use["request"]["body"]["usage_id"],
                         material=feedback_material(store.identity["store_id"], original, use["request"]["body"], body["notes"]))
         m.require(value == expected, "Feedback must preserve the observed original attempt", "CONFLICT")
+    record["receipt_capacity_version"] = 1
     calls[cid] = record
     store._save(db, state)
     return dict(run_id=state["run_id"], call_id=cid)
@@ -154,7 +194,10 @@ def record_ack(store, db, body):
     m.require(receipt["store_id"] == call["knowledge_store_id"]
               and all(receipt[k] == req[k] for k in ("scope", "operation", "request_id"))
               and receipt["fingerprint"] == hashlib.sha256(encoded(req)).hexdigest(), "K receipt does not bind original request", "IDENTITY_CONFLICT")
+    m.natural(receipt["recorded_at"], low=0, high=9007199254740991)
     result = receipt["result"]
+    m.fields(result, "usage_id reused" if req["operation"] == "start_use" else "feedback_id material_id reused")
+    m.require(type(result["reused"]) is bool, "Invalid K reuse flag")
     if req["operation"] == "start_use":
         m.require(result.get("usage_id") == req["body"]["usage_id"], "K usage identity differs", "IDENTITY_CONFLICT")
     else:
@@ -162,6 +205,7 @@ def record_ack(store, db, body):
         m.identity(result.get("feedback_id"))
     m.require(call["receipt"] is None or call["receipt"] == receipt, "Original K receipt changed", "CONFLICT")
     call.update(state="COMMITTED", receipt=receipt)
+    call.pop("receipt_capacity_version", None)
     store._save(db, state)
     return dict(run_id=state["run_id"], call_id=body["call_id"], state="COMMITTED")
 
@@ -221,7 +265,7 @@ class KnowledgeAdapter:
             old = state.get("knowledge_calls", {}).get(cid)
             if old:
                 m.require(old["request"]["body"]["context"] == context, "Original use has another context", "CONFLICT")
-                return self._resume(run_id, cid)
+                return self._resume(run_id, cid, lease)
             k = state["plan"]["knowledge"]
             m.require(k["status"] == "SELECTED" and len(k["items"]) == 1, "Select one knowledge version")
             selected = self.selection(k["items"][0]["version_id"], context)
@@ -229,7 +273,7 @@ class KnowledgeAdapter:
             consumer, task = refs(self.store.identity["store_id"], state)
             cid = self._intent(state, "start_use", dict(usage_id=cid, consumer_ref=consumer, task_ref=task,
                                 version_id=k["items"][0]["version_id"], context=context), "", lease)
-            return self._resume(run_id, cid)
+            return self._resume(run_id, cid, lease)
 
     def feedback(self, run_id, revision, notes):
         with self.store.executor() as lease:
@@ -241,16 +285,16 @@ class KnowledgeAdapter:
             old = current.get("knowledge_calls", {}).get(cid)
             if old:
                 m.require(old["notes"] == notes, "Original feedback differs; resume it before any correction", "CONFLICT")
-                return self._resume(run_id, cid)
+                return self._resume(run_id, cid, lease)
             value = dict(usage_id=use["request"]["body"]["usage_id"], material=feedback_material(self.store.identity["store_id"], state, use["request"]["body"], notes))
             cid = self._intent(state, "complete_use", value, notes, lease)
-            return self._resume(run_id, cid)
+            return self._resume(run_id, cid, lease)
 
     def resume(self, run_id, call_id):
-        with self.store.executor():
-            return self._resume(run_id, call_id)
+        with self.store.executor() as lease:
+            return self._resume(run_id, call_id, lease)
 
-    def _resume(self, run_id, call_id):
+    def _resume(self, run_id, call_id, lease):
         from domain_operational_knowledge_core import KnowledgeError
         state = self.store.get_run(run_id)
         call = state.get("knowledge_calls", {}).get(call_id)
@@ -273,9 +317,19 @@ class KnowledgeAdapter:
             state = current
             # A lost K store must never silently recreate a committed call.
             m.require(call["state"] != "COMMITTED", "Committed K receipt is missing", "IDENTITY_CONFLICT")
-            if req["operation"] == "start_use":
-                m.require(call["attempt_id"] == state["attempt"]["attempt_id"] and not state["cancel"]
-                          and not state["attempt"]["submission_recorded"], "No new adoption for replaced or cancelled work", "NOT_READY")
+            def require_current_attempt(current):
+                if req["operation"] == "start_use":
+                    m.require(call["attempt_id"] == current["attempt"]["attempt_id"] and not current["cancel"]
+                              and not current["attempt"]["submission_recorded"] and not current["attempt"].get("maintenance_stop"),
+                              "No new adoption for replaced or stopped work", "NOT_READY")
+            require_current_attempt(state)
+            if "receipt_capacity_version" not in call:
+                body = dict(run_id=run_id, revision=call["revision"], knowledge_store_id=call["knowledge_store_id"],
+                            request=req, notes=call["notes"])
+                self.store.execute(self._command("knowledge_intent", body, "receipt-capacity-v1"), lease=lease)
+                state = self.store.get_run(run_id)
+                require_current_attempt(state)
+            validate_receipt_capacity(state)
             receipt = k.execute(encoded(req))["receipt"]
         body = dict(run_id=run_id, call_id=call_id, receipt=receipt)
         return self.store.execute(self._command("knowledge_ack", body, "ack"))

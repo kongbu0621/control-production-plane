@@ -177,7 +177,9 @@ class ControlStore:
 
     @staticmethod
     def _save(db, state):
+        from .knowledge import validate_receipt_capacity
         m.validate_tree(state)
+        validate_receipt_capacity(state)
         db.execute("UPDATE runs SET document=? WHERE run_id=?", (m.canonical(state).decode(), state["run_id"]))
 
     @staticmethod

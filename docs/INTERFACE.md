@@ -167,4 +167,6 @@ store = initialize("/absolute/private/new-control-store")
 
 新增本地操作 `knowledge_intent`（需执行租约）和 `knowledge_ack`。前者的 body 恰含 `run_id revision knowledge_store_id request notes`，后者恰含 `run_id call_id receipt`；应由适配器构造。它们将原请求、准确尝试和回执存入运行的 `knowledge_calls`，仍与 P 事件和请求回执同事务提交。`recover.pending_knowledge_calls` 列出未确认的 K 调用，不自动发送。调用者仍属于同一受信域，直接写入的回执不是密码学认证。
 
+新 pending 调用包含 `receipt_capacity_version=1`，表示已在运行记录中预留成功回执和取消记录容量；确认后移除此字段。旧记录可以没有该字段，恢复按[知识接入边界](KNOWLEDGE.md#中断与边界)处理。`knowledge_ack` 校验 K 公共回执的精确结果字段、布尔 `reused` 和非负安全整数时间戳；额外结果字段不被默认为受支持。容量检查中的占位值仅在内存计算，不是持久证据或实际发生的取消。
+
 无需更改原数据库表；旧运行在使用新功能前保持原状。使用新字段后的存储必须继续用 `0.1.0a3` 或兼容后续版本，不能降级到没有采用检查的旧执行器。
