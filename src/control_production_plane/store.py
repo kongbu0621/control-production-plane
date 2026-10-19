@@ -575,6 +575,13 @@ class ControlStore:
                 m.require(isinstance(knowledge_check, _ExecutionCheck),
                           'Fresh knowledge check required; dispatch through perform()', 'NOT_READY')
                 action['knowledge_check'] = knowledge_check.consume(self, action['action_id'], state)
+                # The check is retained with the action and its later response.
+                # Reserve the full declared response byte budget before any
+                # business can run; false is the longer call_closed encoding.
+                completed = dict(action, state='RESPONDED', call_closed=False, response=None)
+                response_capacity = len(m.canonical(completed)) - len(b'null') + state['budget']['max_response_bytes']
+                m.require(response_capacity <= m.MAX_JSON,
+                          'No action capacity for the knowledge check and declared response budget', 'LIMIT')
             self._spend(state, "attempts", "max_attempts")
             state["attempt"]["submission_recorded"] = True
         counter, bound = {"query": ("queries", "max_queries"), "cancel": ("cancellations", "max_cancellations")}.get(kind, ("actions", "max_actions"))

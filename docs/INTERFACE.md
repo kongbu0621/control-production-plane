@@ -176,3 +176,5 @@ store = initialize("/absolute/private/new-control-store")
 `0.1.0a4` 的 `store.perform` 与 `LocalHandAdapter.perform` 接受可选 `knowledge=KnowledgeAdapter(store, config)`。SELECTED 任务的新 submit 必须提供绑定当前 P 句柄的适配器，并取得新的当前状态检查；直接 JSON dispatch 无法代替该调用。普通未选知识任务、query 和 cancel 的原调用方式兼容。
 
 `execute-action` 增加 `--knowledge-adapter FILE`，文件格式与已有知识命令的 `--adapter` 相同。`action.knowledge_check` 是随当次 dispatch 保存的历史观察，不能重放为许可。检查失败保留 QUEUED 和 `preflight_failure`，不花业务额度；已经 MAY_HAVE_RUN 的动作不重新提交。详细窗口和错误语义见[知识接入](KNOWLEDGE.md)。旧安装没有该检查，执行这类任务的进程应统一升级；本版没有改写旧账本或强制迁移数据库。
+
+SELECTED 提交还会在 dispatch 事务内检查原请求、知识观察及完整 `max_response_bytes` 是否共同满足动作记录的 256 KiB 上限。容量不足返回 `LIMIT`，不登记提交、不消耗执行额度、不调用业务；既有动作与原采用保留。该字节容量检查不改变响应 schema、结构限额或实际 I/O 失败的处理。
