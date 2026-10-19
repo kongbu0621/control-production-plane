@@ -76,7 +76,6 @@ def record_intent(store, db, body):
     m.fields(body, 'candidate_id knowledge_store_id scope proposal')
     m.identity(body['knowledge_store_id'])
     m.identity(body['scope'])
-    m.require(len(body['scope']) >= 3, 'K scope must contain at least three characters')
     spec = proposal_spec(body['proposal'])
     candidate = load(db, body['candidate_id'])
     old = candidate.get('delivery_record')

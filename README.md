@@ -29,7 +29,7 @@
 | **control-production-plane（P）** | 协调目标、计划、执行、验证、修复与接续，关联成果及验收决定 |
 | [infra-local-hand](https://github.com/kongbu0621/infra-local-hand) | 执行后端：P 通过其公共入口准备、提交、查询和取消任务；Local Hand 执行获准任务并返回原状态与封存证据 |
 | [infra-artifact-ledger](https://github.com/kongbu0621/infra-artifact-ledger) | 成果存储：P 经现有 `local-hand-archive` 保存成功封存的候选成果，按准确版本读回供审查；Ledger 保存内容与来源 |
-| [domain-operational-knowledge-core（K）](https://github.com/kongbu0621/domain-operational-knowledge-core) | 可选知识组件：提供已准入的准确知识版本；P 登记采用并回流使用反馈，知识审查和状态管理留在 K |
+| [domain-operational-knowledge-core（K）](https://github.com/kongbu0621/domain-operational-knowledge-core) | 可选知识组件：提供已准入的准确知识版本；P 登记采用、回流使用反馈并投递明确学习候选，知识审查和状态管理留在 K |
 
 知识接入是可选能力。任务未把知识列为必需输入时，可以独立推进，并记录未配置或降级的原因；任务若明确要求必需知识，未配置、无匹配或查询失败时，应阻止依赖它的新执行。不能伪造知识查询或回流成功。
 

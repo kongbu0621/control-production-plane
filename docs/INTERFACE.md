@@ -181,7 +181,7 @@ SELECTED 提交还会在 dispatch 事务内检查原请求、知识观察及完�
 
 ## 学习候选投递（0.1.0a5）
 
-`control_production_plane.learning.LearningAdapter(store, config)` 使用与 KnowledgeAdapter 相同的明确 K 配置。`deliver(candidate_id, proposal)` 保存原意图并推进两步；`resume_delivery(candidate_id)` 只用保留请求接续。CLI 对应 `deliver-learning --candidate-id ID --proposal FILE --adapter FILE`、`resume-learning --candidate-id ID --adapter FILE`；`show-learning --candidate-id ID` 读取原候选及当前投递记录。
+`control_production_plane.learning.LearningAdapter(store, config)` 使用与 KnowledgeAdapter 相同的明确 K 配置。其中 `scope` 沿用 P 配置的 1–128 个 ASCII 字符的标识约束，`p`、`pk` 等短作用域有效；不要套用 K 材料 ID 至少三个字符的约束。`deliver(candidate_id, proposal)` 保存原意图并推进两步；`resume_delivery(candidate_id)` 只用保留请求接续。CLI 对应 `deliver-learning --candidate-id ID --proposal FILE --adapter FILE`、`resume-learning --candidate-id ID --adapter FILE`；`show-learning --candidate-id ID` 读取原候选及当前投递记录。
 
 proposal 恰含 `kind content conditions context gaps material_ids`。kind 为 1–64 UTF-8 bytes，content 为 1–65536 bytes，均拒绝 NUL；context/conditions 沿用 K 的最多 16 项字符串映射。gaps 最多 15 条非空、无 NUL、至多 512 bytes 的说明；material_ids 为 0–7 个不同的已有 K 材料 ID，额外加上本次发布的运行材料。完整请求和投递记录仍受 P 的 256 KiB ASCII JSON/结构限额约束，扩展转义后的容量不足在首次 K 写入前拒绝。
 

@@ -213,3 +213,18 @@ a.deliver(v['candidate'],v['proposal'])
             self.assertEqual(raised.exception.code,'BUSY')
             self.p.execute(command('cancel',dict(run_id='example',reason='Cancel production independently')))
         self.assertEqual(self.adapter().deliver(cid,self.proposal())['delivery'],'RECEIVED')
+
+    def test_delivery_accepts_existing_short_and_maximum_scope_configurations(self):
+        for index, scope in enumerate(('p', 'pk', 'p' * 128)):
+            with self.subTest(scope_length=len(scope)):
+                cid = self.candidate('learning:scope-' + str(index))['candidate_id']
+                config = dict(self.config, scope=scope)
+                before = self.p.get_run('example')
+                result = LearningAdapter(self.p, config).deliver(cid, self.proposal())
+                self.assertEqual(result['delivery'], 'RECEIVED')
+                for operation, receipt in result['receipts'].items():
+                    self.assertEqual(receipt['scope'], scope)
+                    self.assertEqual(self.k.get_operation(scope, operation, receipt['request_id'])['receipt'], receipt)
+                reopened = open_store(self.root/'production')
+                self.assertEqual(LearningAdapter(reopened, config).resume_delivery(cid), result)
+                self.assertEqual(reopened.get_run('example'), before)
