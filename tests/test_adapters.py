@@ -415,6 +415,64 @@ class AdapterTests(unittest.TestCase):
         bad=copy.deepcopy(decision);bad['request_id']=str(uuid.uuid4());bad['body']['checks'][0]['passed']=False
         with self.assertRaises(ControlError):self.store.execute(bad)
 
+    def test_restored_archive_reuses_old_receipt_and_accepts_new_task(self):
+        import shutil
+        import infra_artifact_ledger as ledger_api
+        from infra_artifact_ledger import recovery
+        from local_hand_jobs import artifact_archive as archive_api
+        evidence, original = self.sealed()
+        archive = self.root / 'archive'
+        checkpoint = archive_api.recovery_checkpoint(archive)
+        checkpoint_file = self.root / 'trusted-checkpoint.json'
+        checkpoint_file.write_bytes(model.canonical(checkpoint))
+        snapshots = self.root / 'snapshots'; snapshots.mkdir(mode=0o700)
+        scratch = self.root / 'scratch'; scratch.mkdir(mode=0o700)
+        snapshot = recovery.create(db=archive/'ledger.sqlite', output_root=snapshots,
+            snapshot_id=uuid.uuid4().hex, source_commit='1'*40)['data']
+        restored = self.root / 'restored'
+        result = recovery.restore(snapshot=Path(snapshot['snapshot_path']), target_dir=restored,
+            expected_manifest_sha256=snapshot['manifest_sha256'], scratch_parent=scratch)['data']
+        retained_archive = self.root / 'retained-archive'
+        archive.rename(retained_archive); shutil.copytree(retained_archive, archive)
+        (archive/'ledger.sqlite').unlink(); shutil.copy2(restored/'ledger.sqlite', archive/'ledger.sqlite')
+        def tree(root):
+            return {str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
+                    for p in root.rglob('*') if p.is_file()}
+        retained_files = tree(retained_archive)
+        before = tree(archive)
+        with self.assertRaises(ControlError): self.artifacts.resume('example')
+        archive_api.bind_restored(archive, checkpoint_path=checkpoint_file,
+            expected_checkpoint_sha256=checkpoint['checkpoint_sha256'],
+            expected_database_sha256=result['database_sha256'])
+        bound = tree(archive)
+        self.assertEqual({p:bound[p] for p in before}, before)
+        resumed = self.artifacts.resume('example')
+        self.assertTrue(resumed['reused'])
+        for key in ('artifact_id','version_id','recorded_at','files'):
+            self.assertEqual(resumed[key], original[key])
+        self.artifacts.read('example', artifact_id=resumed['artifact_id'],
+            version_id=resumed['version_id'], output=self.root/'restored-old-read')
+        self.assertEqual(tree(archive), bound)
+        # A separate synthetic P run supplies a new task, not a relabelled old result.
+        other = AdapterTests(); other.setUp(); self.addCleanup(other.doCleanups)
+        new_evidence = other.unarchived_evidence()
+        other.artifacts = ArtifactAdapter(other.store, self.artifacts.command, archive,
+                                         other.root/'restored-artifacts')
+        created = other.artifacts.archive('example', new_evidence)
+        self.assertFalse(created['reused'])
+        self.assertNotEqual(created['operation_id'], original['operation_id'])
+        self.assertNotEqual(created['version_id'], original['version_id'])
+        read = other.artifacts.read('example', artifact_id=created['artifact_id'],
+            version_id=created['version_id'], output=other.root/'new-restored-read')
+        self.assertTrue(read['content_verified'])
+        self.assertEqual(other.store.get_run('example')['attempt']['candidate']['version_id'], created['version_id'])
+        self.assertTrue(other.artifacts.resume('example')['reused'])
+        with ledger_api.open(archive/'ledger.sqlite') as ledger:
+            self.assertEqual(ledger.verify()['counts']['versions'], 2)
+        self.assertEqual(tree(retained_archive), retained_files)
+        self.assertEqual(sum(r['tool']=='lh_job_submit' for r in self.requests), 1)
+        self.assertEqual(sum(r['tool']=='lh_job_submit' for r in other.requests), 1)
+
     def test_additional_validation_changes_cannot_become_candidate(self):
         _,archived=self.sealed(extra_change=True)
         with self.assertRaises(ControlError) as raised:
